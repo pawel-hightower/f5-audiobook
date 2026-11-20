@@ -6,11 +6,12 @@ build-backend = "hatchling.build"
 name = "f5-audiobook"
 version = "0.2.0"
 description = "Desktopowa aplikacja do generowania polskich audiobooków z ebooków przy użyciu F5-TTS IPA"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "torch>=2.6.0,<2.9.0",
     "torchaudio>=2.6.0,<2.9.0",
     "f5-tts",
+    "audioop-lts; python_version >= '3.13'",
     "soundfile",
     "numpy",
     "phonemizer-fork",

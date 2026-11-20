@@ -1213,8 +1213,11 @@ class MainWindow(QMainWindow):
             return
 
         self.btn_export.setEnabled(False)
+        self.btn_export.setText("⏳ Eksportuję...")
+        self.progress_bar.setRange(0, 0)  # animowany pasek w trakcie masteringu FFmpeg
         bitrate = str(self.combo_bitrate.currentData() or "64k")
         pause_scale = float(self.combo_pause_scale.currentData() or 1.0)
+        self.lbl_progress.setText(f"⏳ Trwa mastering EBU R128 i eksport ({bitrate})...")
         self._log(f"Rozpoczynam mastering i eksport audiobooka (bitrate: {bitrate}, pauzy: {pause_scale:.1f}x)...")
         self.export_worker = ExportWorker(
             db=self.db,
@@ -1232,6 +1235,9 @@ class MainWindow(QMainWindow):
 
     def _on_export_done(self, res: ExportResult) -> None:
         self.btn_export.setEnabled(True)
+        self.btn_export.setText("📦 Eksportuj Audiobooka")
+        self.progress_bar.setRange(0, 100)
+        self._update_progress_widgets(self._last_progress)
         mins = res.total_duration_sec / 60.0
         msg = (
             f"Audiobook gotowy ({mins:.1f} min)!\n\n"
@@ -1243,6 +1249,9 @@ class MainWindow(QMainWindow):
 
     def _on_export_failed(self, err: str) -> None:
         self.btn_export.setEnabled(True)
+        self.btn_export.setText("📦 Eksportuj Audiobooka")
+        self.progress_bar.setRange(0, 100)
+        self._update_progress_widgets(self._last_progress)
         self._log(f"[BŁĄD EKSPORTU] {err}")
         QMessageBox.critical(self, "Błąd eksportu", err)
 
