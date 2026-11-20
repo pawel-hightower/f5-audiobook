@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "f5-audiobook"
+version = "0.2.0"
+description = "Desktopowa aplikacja do generowania polskich audiobooków z ebooków przy użyciu F5-TTS IPA"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.6.0,<2.9.0",
+    "torchaudio>=2.6.0,<2.9.0",
+    "f5-tts",
+    "soundfile",
+    "numpy",
+    "phonemizer-fork",
+    "espeakng-loader",
+    "ebooklib",
+    "beautifulsoup4",
+    "lxml",
+    "num2words",
+    "faster-whisper",
+    "PySide6",
+]
+
+[project.scripts]
+f5-audiobook = "f5_audiobook.gui.app:main"
+f5-audiobook-cli = "f5_audiobook.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/f5_audiobook"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
