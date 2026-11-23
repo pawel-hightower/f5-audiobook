@@ -7,7 +7,9 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, XMLParsedAsHTMLWarning
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # Nagłówki sekcji, które zazwyczaj nie są treścią książki (domyślnie odznaczone w GUI)
 _SKIP_TITLE_PATTERNS = re.compile(

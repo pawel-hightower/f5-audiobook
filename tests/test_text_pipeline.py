@@ -43,6 +43,10 @@ def test_polish_normalizer() -> None:
     d1 = normalize_polish_text("— Nie wolno ci — powiedział porucznik Bartosz. — Wiatr znowu wieje.")
     assert ".," not in d1, d1
     assert "Bartosz. Wiatr" in d1, d1
+    assert "Nie wolno ci. Powiedział porucznik Bartosz." in d1, d1
+
+    d2 = normalize_polish_text("— Nie wolno ci ponownie schodzić pod wodę, Kowalska — powiedział porucznik Bartosz.")
+    assert "Kowalska. Powiedział" in d2, d2
 
 
 def test_chunker_merges_short_and_splits_long() -> None:

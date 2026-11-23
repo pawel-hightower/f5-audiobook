@@ -44,6 +44,9 @@ def text_to_ipa_pl(text: str) -> str:
     # Usuwamy tagi przełączania języka np. (en), (pl) oraz znak przedłużenia 'ː'
     ipa = re.sub(r"\([a-z]{2,3}\)", "", ipa)
     ipa = ipa.replace("ː", "")
+    # Zapobiega zlewaniu grupy końcowej '-tr' przed dźwięczną (np. "Wiatr znowu" -> espeak daje vʲˈadr zamiast vʲˈatr)
+    if re.search(r"tr(?=\s)", text, re.IGNORECASE):
+        ipa = re.sub(r"dr(?=\s)", "tr", ipa)
     return re.sub(r"\s+", " ", ipa).strip()
 
 

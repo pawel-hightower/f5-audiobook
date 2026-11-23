@@ -17,10 +17,10 @@ class VoiceProfile:
     display_name: str
     ref_audio: str  # ścieżka względna wobec katalogu profilu lub absolutna
     ref_text: str
-    speed: float = 1.15
-    cfg_strength: float = 2.0
-    nfe_step: int = 32
-    seed: int = 101
+    speed: float = 0.94
+    cfg_strength: float = 2.2
+    nfe_step: int = 36
+    seed: int = 202
     notes: str = ""
 
     @property

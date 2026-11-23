@@ -152,6 +152,22 @@ _MONTHS_GEN = (
     "lipca|sierpnia|września|października|listopada|grudnia"
 )
 
+# Polskie czasowniki w didaskaliach dialogowych po myślniku ("— Kowalska — powiedział..." -> "Kowalska. Powiedział...")
+# Zapobiega to podwójnemu przecinkowi wokół wołacza, który podbija intonację jak w pytaniu.
+_DIALOGUE_TAG_RE = re.compile(
+    r"(?<![.!?])\s+[—–]\s+("
+    r"(?:po|od|wy|za|do|prze|przy|u|w|z|roz|na|o)?(?:wiedział|parł|pytał|dawał|dał|krzyknął|"
+    r"szepnął|mruknął|stwierdził|trącił|ciągnął|jaśnił|uważył|stchnął|rychnął|arknął|wołał|"
+    r"rzucił|śmiechnął|kiwał|kwitował|mówił|pierał|łumaczył|jęknął|burknął|syknął|rzekł|"
+    r"znajmił|znał|pewnił|strzegł|prosił|kazał|ponował|gerował|skazał|skinął|machnął|"
+    r"spojrzał|wrócił|śmiał|arsknął|hrząknął|myślał|krzyczał|szeptał|mamrotał|dopytywał|"
+    r"dodał|odrzekł|odparł|odpowiedział|wyjaśnił|zauważył|westchnął|warknął|prychnął|"
+    r"rzucił|mruknął|bąknął|warknęł|szepnęł|krzyknęł|uśmiechnęł|westchnęł|skinęł|machnęł|"
+    r"upierał|tłumaczył|ciągnął|wtrącił|dorzucił|przerwał|dokończył|skwitował|stwierdził)"
+    r"[aąeioyłu]*)\b",
+    re.IGNORECASE,
+)
+
 # Wzorce kontekstowe dla polskiej odmiany
 _ROMAN_ORDINAL_PREFIX_RE = re.compile(
     r"\b(Rozdział|Część|Tom|Księga|Akt|Scena|Punkt|Paragraf)\s+([IVXL]{1,6})\b",
@@ -279,6 +295,9 @@ def normalize_polish_text(
     text = re.sub(r"^\s*[—–-]\s+", "", text)
     # Po kropce/wykrzykniku/pytajniku myślnik dialogowy (". — ") nie dodaje przecinka
     text = re.sub(r"([.!?])\s*[—–]\s*", r"\1 ", text)
+    # Myślnik przed didaskaliami dialogowymi ("— powiedział", "— upierała się") zamykamy kropką
+    # zamiast przecinka, co utrzymuje stanowczą, oznajmującą intonację na końcu wypowiedzi!
+    text = _DIALOGUE_TAG_RE.sub(lambda m: f". {m.group(1)[0].upper()}{m.group(1)[1:]}", text)
     text = re.sub(r"\s+[—–]\s+", ", ", text)
     text = re.sub(r"[—–]", ", ", text)
 

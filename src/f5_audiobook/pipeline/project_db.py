@@ -341,6 +341,26 @@ class ProjectDB:
                 (new_normalized_text.strip(), chunk_id),
             )
 
+    def reapply_pronunciation_to_pending(self, pronunciation_dict: dict[str, str]) -> int:
+        """Stosuje aktualny słownik wymowy do wszystkich jeszcze niewygenerowanych (pending) chunków."""
+        from f5_audiobook.text.normalizer_pl import normalize_polish_text
+
+        updated = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, normalized_text FROM chunks WHERE status = 'pending'"
+            ).fetchall()
+            for r in rows:
+                old_txt = r["normalized_text"]
+                new_txt = normalize_polish_text(old_txt, pronunciation_dict)
+                if new_txt and new_txt != old_txt:
+                    conn.execute(
+                        "UPDATE chunks SET normalized_text=? WHERE id=?",
+                        (new_txt, r["id"]),
+                    )
+                    updated += 1
+        return updated
+
     def chunk_audio_path(self, chunk: ChunkRow) -> Path:
         return self.chunks_dir / f"ch{chunk.chapter_index:03d}_c{chunk.chunk_index:05d}.wav"
 

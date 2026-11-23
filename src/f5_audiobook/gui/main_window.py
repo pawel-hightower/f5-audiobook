@@ -191,8 +191,17 @@ class MainWindow(QMainWindow):
         btn_sel_all.clicked.connect(lambda: self._set_all_chapters(True))
         btn_sel_none = QPushButton("Odznacz wszystkie")
         btn_sel_none.clicked.connect(lambda: self._set_all_chapters(False))
+        btn_sel_highlighted = QPushButton("☑ Zaznacz podświetlone")
+        btn_sel_highlighted.setToolTip("Stawia ptaszek przy wszystkich wierszach zaznaczonych z Shift / Ctrl")
+        btn_sel_highlighted.clicked.connect(lambda: self._set_highlighted_chapters(True))
+        btn_unsel_highlighted = QPushButton("☐ Odznacz podświetlone")
+        btn_unsel_highlighted.setToolTip("Zdejmuje ptaszek ze wszystkich wierszy zaznaczonych z Shift / Ctrl")
+        btn_unsel_highlighted.clicked.connect(lambda: self._set_highlighted_chapters(False))
         sel_bar.addWidget(btn_sel_all)
         sel_bar.addWidget(btn_sel_none)
+        sel_bar.addSpacing(8)
+        sel_bar.addWidget(btn_sel_highlighted)
+        sel_bar.addWidget(btn_unsel_highlighted)
         sel_bar.addStretch()
         left_lay.addLayout(sel_bar)
 
@@ -204,6 +213,7 @@ class MainWindow(QMainWindow):
         self.tbl_chapters.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.tbl_chapters.setAlternatingRowColors(True)
         self.tbl_chapters.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl_chapters.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tbl_chapters.itemChanged.connect(self._on_chapter_checkbox_changed)
         self.tbl_chapters.itemSelectionChanged.connect(self._on_chapter_selected_preview)
         left_lay.addWidget(self.tbl_chapters)
@@ -249,7 +259,7 @@ class MainWindow(QMainWindow):
 
         self.btn_reset_voice_defaults = QPushButton("↩ Domyślne")
         self.btn_reset_voice_defaults.setToolTip(
-            "Przywraca wypracowane domyślne parametry syntezy (speed=1.15, CFG=2.00, ODE=32, Seed=101)"
+            "Przywraca wypracowane domyślne parametry syntezy (speed=0.94, CFG=2.20, ODE=36, Seed=202)"
         )
         self.btn_reset_voice_defaults.clicked.connect(self._on_reset_voice_defaults)
         top_bar.addWidget(self.btn_reset_voice_defaults)
@@ -604,12 +614,18 @@ class MainWindow(QMainWindow):
         btn_add.clicked.connect(self._on_pron_add_row)
         btn_del = QPushButton("🗑 Usuń zaznaczony")
         btn_del.clicked.connect(self._on_pron_delete_row)
+        btn_apply_pending = QPushButton("🔄 Zastosuj do oczekujących w projekcie")
+        btn_apply_pending.setToolTip(
+            "Aktualizuje zapisany słownik i przelicza tekst wszystkich jeszcze niewygenerowanych (pending) zdań w otwartym projekcie"
+        )
+        btn_apply_pending.clicked.connect(self._on_pron_apply_to_pending)
         btn_save = QPushButton("💾 Zapisz słownik")
         btn_save.setObjectName("primaryBtn")
         btn_save.clicked.connect(self._on_pron_save)
         btn_bar.addWidget(btn_add)
         btn_bar.addWidget(btn_del)
         btn_bar.addStretch()
+        btn_bar.addWidget(btn_apply_pending)
         btn_bar.addWidget(btn_save)
         layout.addLayout(btn_bar)
 
@@ -733,6 +749,25 @@ class MainWindow(QMainWindow):
         self._refresh_chunks_table()
         self._update_progress_widgets()
 
+    def _set_highlighted_chapters(self, selected: bool) -> None:
+        if self.db is None:
+            return
+        sel_rows = sorted({idx.row() for idx in self.tbl_chapters.selectionModel().selectedRows()})
+        if not sel_rows:
+            QMessageBox.information(
+                self,
+                "Brak zaznaczonych wierszy",
+                "Najpierw podświetl jeden lub kilka rozdziałów na liście (np. klikając z wciśniętym Shift lub Ctrl).",
+            )
+            return
+        for row_idx in sel_rows:
+            item0 = self.tbl_chapters.item(row_idx, 0)
+            if item0 is not None and item0.data(Qt.UserRole) is not None:
+                self.db.set_chapter_selected(int(item0.data(Qt.UserRole)), selected)
+        self._refresh_chapters_table()
+        self._refresh_chunks_table()
+        self._update_progress_widgets()
+
     def _on_chapter_checkbox_changed(self, item: QTableWidgetItem) -> None:
         if self.db is None or item.column() != 0:
             return
@@ -849,23 +884,24 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "Przywrócić domyślne?",
-            "Przywrócić wypracowane domyślne parametry syntezy (speed=1.15, CFG=2.00, ODE=32, Seed=101)"
-            + (" oraz oryginalną próbkę ref_7s.wav?" if profile.name == "moj_lektor" else "?"),
+            "Przywrócić wypracowane domyślne parametry syntezy (speed=0.94, CFG=2.20, ODE=36, Seed=202)"
+            + (" oraz oryginalną próbkę ref_gosztyla.wav?" if profile.name == "moj_lektor" else "?"),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
 
-        self.spn_speed.setValue(1.15)
-        self.spn_cfg.setValue(2.0)
-        self.spn_nfe.setValue(32)
-        self.spn_seed.setValue(101)
+        self.spn_speed.setValue(0.94)
+        self.spn_cfg.setValue(2.2)
+        self.spn_nfe.setValue(36)
+        self.spn_seed.setValue(202)
         if profile.name == "moj_lektor":
-            self.ed_voice_display.setText("Mój Lektor (domyślny)")
-            self.ed_ref_audio.setText("ref_7s.wav")
+            self.ed_voice_display.setText("Krzysztof Gosztyła (domyślny)")
+            self.ed_ref_audio.setText("ref_gosztyla.wav")
             self.ed_ref_text.setPlainText(
-                "Smród panujący w chlewni zdawał się mieć niemal płynną formę."
+                "A niektóre nawet jeszcze się powiększyły, jak to zwykle bywa, "
+                "pojawili się też nowi milionerzy żerujący na czasach kryzysu."
             )
         save_voice_profile(self._current_voice_from_ui(), VOICES_DIR)
         self._refresh_voices(select_name=profile.name)
@@ -1277,7 +1313,7 @@ class MainWindow(QMainWindow):
         for r in rows:
             self.tbl_pron.removeRow(r)
 
-    def _on_pron_save(self) -> None:
+    def _collect_pronunciation_from_table(self) -> dict[str, str]:
         mapping: dict[str, str] = {}
         for r in range(self.tbl_pron.rowCount()):
             k_item = self.tbl_pron.item(r, 0)
@@ -1286,8 +1322,31 @@ class MainWindow(QMainWindow):
             v = v_item.text().strip() if v_item else ""
             if k and v:
                 mapping[k] = v
+        return mapping
+
+    def _on_pron_save(self) -> None:
+        mapping = self._collect_pronunciation_from_table()
         save_pronunciation_dict(mapping)
         QMessageBox.information(self, "Zapisano", f"Zapisano słownik wymowy ({len(mapping)} wpisów).")
+
+    def _on_pron_apply_to_pending(self) -> None:
+        mapping = self._collect_pronunciation_from_table()
+        save_pronunciation_dict(mapping)
+        if self.db is None:
+            QMessageBox.information(
+                self,
+                "Zapisano słownik",
+                f"Zapisano słownik ({len(mapping)} wpisów). Brak otwartego projektu do przeliczenia.",
+            )
+            return
+        changed = self.db.reapply_pronunciation_to_pending(mapping)
+        self._refresh_chunks_table()
+        self._on_chapter_selected_preview()
+        QMessageBox.information(
+            self,
+            "Zastosowano słownik",
+            f"Zapisano słownik ({len(mapping)} wpisów) i zaktualizowano {changed} oczekujących (niewygenerowanych) fragmentów.",
+        )
 
     def closeEvent(self, event) -> None:
         _stop_wav_playback()
