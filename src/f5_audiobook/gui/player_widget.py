@@ -1,0 +1,1170 @@
+"""Zakładka 5: Wbudowany odtwarzacz audiobooków (styl Smart AudioBook Player) z karaoke tekstu na żywo."""
+
+from __future__ import annotations
+
+import bisect
+import json
+import time
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+
+from PySide6.QtCore import QCoreApplication, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+from f5_audiobook.config import WORK_DIR
+from f5_audiobook.pipeline.project_db import ChapterRow, ChunkRow, ProjectDB
+
+STATS_FILE = WORK_DIR / "player_stats.json"
+
+
+def _fmt_mmss(ms: int) -> str:
+    total_sec = max(0, int(ms // 1000))
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _fmt_duration_human(sec: float) -> str:
+    total_sec = max(0, int(round(sec)))
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    if m > 0:
+        return f"{m} min"
+    return f"{s} s"
+
+
+@dataclass
+class _PlayableEntry:
+    chunk: ChunkRow
+    audio_path: Path
+    duration_ms: int
+    pause_ms: int
+    book_start_ms: int
+    book_audio_end_ms: int
+    book_end_ms: int
+    ch_start_ms: int
+    ch_audio_end_ms: int
+    ch_end_ms: int
+
+
+class AudiobookPlayerWidget(QWidget):
+    """Wbudowany odtwarzacz audiobooków z synchronizowanym tekstem (karaoke) i statystykami słuchania."""
+
+    edit_chunk_requested = Signal(int)  # chunk_id -> przejście do edycji/regeneracji w Zakładce 3
+    status_message = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None, stats_path: Path = STATS_FILE) -> None:
+        super().__init__(parent)
+        self.db: ProjectDB | None = None
+        self._stats_path = Path(stats_path)
+
+        # Multimedia (QtMultimedia — zachowuje barwę głosu przy zmianie tempa)
+        self._audio_out = QAudioOutput(self)
+        self._audio_out.setVolume(1.0)
+        self._player = QMediaPlayer(self)
+        self._player.setAudioOutput(self._audio_out)
+        self._player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self._player.errorOccurred.connect(self._on_media_error)
+
+        # Stan osi czasu
+        self._chapters: list[ChapterRow] = []
+        self._playable: list[_PlayableEntry] = []
+        self._playable_starts_ms: list[int] = []
+        self._chunk_id_to_playable_idx: dict[int, int] = {}
+        self._chapter_first_playable_idx: dict[int, int] = {}
+        self._chapter_duration_ms: dict[int, int] = {}
+        self._book_total_ms: int = 0
+
+        # Stan odtwarzania
+        self._current_idx: int = -1
+        self._current_chapter_id: int | None = None
+        self._current_source_path: Path | None = None
+        self._is_playing: bool = False
+        self._playback_rate: float = 1.0
+        self._muted: bool = False
+        self._in_pause_gap: bool = False
+        self._pause_gap_start_mono: float = 0.0
+        self._pause_gap_duration_ms: int = 0
+        self._pending_seek_ms: int | None = None
+        self._pending_autoplay: bool = False
+        self._slider_dragging: bool = False
+        self._karaoke_font_pt: int = 12
+        self._karaoke_chunk_to_row: dict[int, int] = {}
+
+        # Statystyki słuchania
+        self._global_stats: dict = self._load_global_stats()
+        self._book_listened_sec: float = 0.0
+        self._session_listened_sec: float = 0.0
+        self._last_tick_mono: float | None = None
+        self._last_persist_mono: float = time.monotonic()
+
+        # Timery
+        self._pause_timer = QTimer(self)
+        self._pause_timer.setSingleShot(True)
+        self._pause_timer.timeout.connect(self._on_pause_gap_finished)
+
+        self._ui_timer = QTimer(self)
+        self._ui_timer.setInterval(150)
+        self._ui_timer.timeout.connect(self._on_ui_tick)
+        self._ui_timer.start()
+
+        self._build_ui()
+        self._update_controls_enabled()
+        self._update_stats_display()
+
+    # =========================================================================
+    # INTERFEJS (PIONOWY PODZIAŁ 50/50: STEROWANIE | KARAOKE TEKSTU)
+    # =========================================================================
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        # ----- LEWA POŁOWA: STEROWANIE AUDIOBOOKIEM -----
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(4, 4, 8, 4)
+        left_lay.setSpacing(10)
+
+        # Nagłówek książki (okładka + tytuł + autor + rozdział)
+        header_box = QGroupBox("Teraz słuchasz")
+        header_lay = QHBoxLayout(header_box)
+
+        self.lbl_cover = QLabel("Brak\nokładki")
+        self.lbl_cover.setFixedSize(92, 130)
+        self.lbl_cover.setAlignment(Qt.AlignCenter)
+        self.lbl_cover.setStyleSheet("border: 1px solid #323846; background: #13151a; color: #7d8590;")
+        header_lay.addWidget(self.lbl_cover)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(5)
+        self.lbl_title = QLabel("Nie wczytano projektu")
+        self.lbl_title.setStyleSheet("font-size: 13pt; font-weight: bold; color: #f0f4f8;")
+        self.lbl_title.setWordWrap(True)
+        self.lbl_author = QLabel("—")
+        self.lbl_author.setStyleSheet("font-size: 10pt; color: #9aa3b2;")
+
+        ch_nav_row = QHBoxLayout()
+        ch_nav_row.setSpacing(4)
+        self.btn_prev_chapter = QPushButton("⟨")
+        self.btn_prev_chapter.setFixedWidth(30)
+        self.btn_prev_chapter.setToolTip("Poprzedni rozdział")
+        self.btn_prev_chapter.clicked.connect(self.prev_chapter)
+
+        self.combo_chapters = QComboBox()
+        self.combo_chapters.currentIndexChanged.connect(self._on_chapter_combo_changed)
+
+        self.btn_next_chapter = QPushButton("⟩")
+        self.btn_next_chapter.setFixedWidth(30)
+        self.btn_next_chapter.setToolTip("Następny rozdział")
+        self.btn_next_chapter.clicked.connect(self.next_chapter)
+
+        ch_nav_row.addWidget(self.btn_prev_chapter)
+        ch_nav_row.addWidget(self.combo_chapters, 1)
+        ch_nav_row.addWidget(self.btn_next_chapter)
+
+        self.lbl_ready_info = QLabel("Wygenerowane fragmenty do odsłuchu: 0")
+        self.lbl_ready_info.setStyleSheet("color: #8ab4f8; font-size: 9pt;")
+
+        title_col.addWidget(self.lbl_title)
+        title_col.addWidget(self.lbl_author)
+        title_col.addLayout(ch_nav_row)
+        title_col.addWidget(self.lbl_ready_info)
+        title_col.addStretch()
+        header_lay.addLayout(title_col, 1)
+        left_lay.addWidget(header_box)
+
+        # Postęp rozdziału + książki
+        progress_box = QGroupBox("Pozycja i sterowanie")
+        prog_lay = QVBoxLayout(progress_box)
+        prog_lay.setSpacing(8)
+
+        self.slider_chapter = QSlider(Qt.Horizontal)
+        self.slider_chapter.setRange(0, 1000)
+        self.slider_chapter.setValue(0)
+        self.slider_chapter.sliderPressed.connect(self._on_slider_pressed)
+        self.slider_chapter.sliderMoved.connect(self._on_slider_moved)
+        self.slider_chapter.sliderReleased.connect(self._on_slider_released)
+        prog_lay.addWidget(self.slider_chapter)
+
+        time_row = QHBoxLayout()
+        self.lbl_ch_elapsed = QLabel("00:00")
+        self.lbl_ch_elapsed.setStyleSheet("font-family: Consolas, monospace; font-size: 10pt;")
+        self.lbl_ch_pct = QLabel("Rozdział: 0%")
+        self.lbl_ch_pct.setAlignment(Qt.AlignCenter)
+        self.lbl_ch_pct.setStyleSheet("color: #9aa3b2; font-size: 9pt;")
+        self.lbl_ch_total = QLabel("00:00")
+        self.lbl_ch_total.setStyleSheet("font-family: Consolas, monospace; font-size: 10pt;")
+        time_row.addWidget(self.lbl_ch_elapsed)
+        time_row.addWidget(self.lbl_ch_pct, 1)
+        time_row.addWidget(self.lbl_ch_total)
+        prog_lay.addLayout(time_row)
+
+        # Przyciski transportu (jak w Smart AudioBook Player: -1m | -10s | PLAY/PAUSE | +10s | +1m)
+        transport_row = QHBoxLayout()
+        transport_row.setSpacing(6)
+
+        self.btn_back_60 = QPushButton("⏮ -1m")
+        self.btn_back_60.setMinimumHeight(40)
+        self.btn_back_60.setToolTip("Cofnij o 1 minutę (Shift+← lub Ctrl+Shift+←)")
+        self.btn_back_60.clicked.connect(lambda: self.seek_relative_ms(-60_000))
+
+        self.btn_back_10 = QPushButton("⏪ -10s")
+        self.btn_back_10.setMinimumHeight(40)
+        self.btn_back_10.setToolTip("Cofnij o 10 sekund (← lub Ctrl+←)")
+        self.btn_back_10.clicked.connect(lambda: self.seek_relative_ms(-10_000))
+
+        self.btn_play_pause = QPushButton("▶ Odtwórz")
+        self.btn_play_pause.setObjectName("primaryBtn")
+        self.btn_play_pause.setMinimumHeight(46)
+        self.btn_play_pause.setMinimumWidth(130)
+        self.btn_play_pause.setStyleSheet("font-size: 11pt; font-weight: bold;")
+        self.btn_play_pause.setToolTip("Odtwórz / Pauza (Spacja w zakładce Odtwarzacz lub Ctrl+Spacja wszędzie)")
+        self.btn_play_pause.clicked.connect(self.toggle_play_pause)
+
+        self.btn_fwd_10 = QPushButton("⏩ +10s")
+        self.btn_fwd_10.setMinimumHeight(40)
+        self.btn_fwd_10.setToolTip("Do przodu o 10 sekund (→ lub Ctrl+→)")
+        self.btn_fwd_10.clicked.connect(lambda: self.seek_relative_ms(10_000))
+
+        self.btn_fwd_60 = QPushButton("⏭ +1m")
+        self.btn_fwd_60.setMinimumHeight(40)
+        self.btn_fwd_60.setToolTip("Do przodu o 1 minutę (Shift+→ lub Ctrl+Shift+→)")
+        self.btn_fwd_60.clicked.connect(lambda: self.seek_relative_ms(60_000))
+
+        transport_row.addWidget(self.btn_back_60)
+        transport_row.addWidget(self.btn_back_10)
+        transport_row.addWidget(self.btn_play_pause, 1)
+        transport_row.addWidget(self.btn_fwd_10)
+        transport_row.addWidget(self.btn_fwd_60)
+        prog_lay.addLayout(transport_row)
+
+        # Całkowity postęp w książce
+        book_prog_row = QHBoxLayout()
+        book_prog_row.addWidget(QLabel("Książka:"))
+        self.bar_book_progress = QProgressBar()
+        self.bar_book_progress.setRange(0, 1000)
+        self.bar_book_progress.setValue(0)
+        self.bar_book_progress.setFixedHeight(14)
+        self.bar_book_progress.setFormat("")
+        book_prog_row.addWidget(self.bar_book_progress, 1)
+        self.lbl_book_time = QLabel("00:00 / 00:00")
+        self.lbl_book_time.setStyleSheet("color: #9aa3b2; font-size: 9pt; font-family: Consolas, monospace;")
+        book_prog_row.addWidget(self.lbl_book_time)
+        prog_lay.addLayout(book_prog_row)
+
+        left_lay.addWidget(progress_box)
+
+        # Tempo i głośność
+        audio_box = QGroupBox("Tempo i głośność")
+        audio_lay = QVBoxLayout(audio_box)
+        audio_lay.setSpacing(8)
+
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("Tempo:"))
+        self.spin_speed = QDoubleSpinBox()
+        self.spin_speed.setRange(0.60, 2.50)
+        self.spin_speed.setSingleStep(0.05)
+        self.spin_speed.setDecimals(2)
+        self.spin_speed.setSuffix("x")
+        self.spin_speed.setValue(1.00)
+        self.spin_speed.setFixedWidth(82)
+        self.spin_speed.valueChanged.connect(self._on_speed_changed)
+        speed_row.addWidget(self.spin_speed)
+
+        for preset in (1.0, 1.15, 1.25, 1.5, 1.75):
+            btn_p = QPushButton(f"{preset:g}x")
+            btn_p.setFixedWidth(48)
+            btn_p.setToolTip(f"Ustaw tempo {preset:g}x")
+            btn_p.clicked.connect(lambda _chk=False, v=preset: self.set_playback_rate(v))
+            speed_row.addWidget(btn_p)
+        speed_row.addStretch()
+        audio_lay.addLayout(speed_row)
+
+        vol_row = QHBoxLayout()
+        self.btn_mute = QPushButton("🔊")
+        self.btn_mute.setFixedWidth(36)
+        self.btn_mute.setToolTip("Wycisz / Odcisz")
+        self.btn_mute.clicked.connect(self._on_toggle_mute)
+        self.slider_volume = QSlider(Qt.Horizontal)
+        self.slider_volume.setRange(0, 100)
+        self.slider_volume.setValue(100)
+        self.slider_volume.valueChanged.connect(self._on_volume_changed)
+        self.lbl_volume = QLabel("100%")
+        self.lbl_volume.setFixedWidth(40)
+        self.lbl_volume.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        vol_row.addWidget(QLabel("Głośność:"))
+        vol_row.addWidget(self.btn_mute)
+        vol_row.addWidget(self.slider_volume, 1)
+        vol_row.addWidget(self.lbl_volume)
+        audio_lay.addLayout(vol_row)
+
+        left_lay.addWidget(audio_box)
+
+        # Statystyki słuchania
+        stats_box = QGroupBox("Statystyki słuchania")
+        stats_lay = QVBoxLayout(stats_box)
+        stats_lay.setSpacing(4)
+        self.lbl_stats_main = QLabel("Dzisiaj: 0 s  •  Ta książka: 0 s  •  Łącznie: 0 s")
+        self.lbl_stats_main.setStyleSheet("font-size: 10pt; font-weight: bold; color: #e2e8f0;")
+        self.lbl_stats_sub = QLabel("Pozostało do końca gotowego audio: —")
+        self.lbl_stats_sub.setStyleSheet("font-size: 9pt; color: #9aa3b2;")
+        stats_lay.addWidget(self.lbl_stats_main)
+        stats_lay.addWidget(self.lbl_stats_sub)
+        left_lay.addWidget(stats_box)
+
+        # Podpowiedź skrótów klawiszowych
+        shortcuts_frame = QFrame()
+        shortcuts_frame.setStyleSheet(
+            "QFrame { background-color: #161922; border: 1px solid #2b3140; border-radius: 6px; padding: 6px; }"
+        )
+        sc_lay = QVBoxLayout(shortcuts_frame)
+        sc_lay.setContentsMargins(8, 6, 8, 6)
+        lbl_sc = QLabel(
+            "<b>Skróty klawiszowe w aplikacji:</b><br>"
+            "• <b>Ctrl+Spacja</b> (lub <b>Spacja</b> tutaj) — Odtwórz / Pauza &nbsp;|&nbsp; "
+            "<b>[</b> / <b>]</b> — wolniej / szybciej<br>"
+            "• <b>Ctrl+← / Ctrl+→</b> (lub <b>← / →</b> tutaj) — -10s / +10s &nbsp;|&nbsp; "
+            "<b>Shift+← / Shift+→</b> — -1 min / +1 min<br>"
+            "• Obsługuje też klawisze multimedialne klawiatury (Play/Pause, Prev/Next)."
+        )
+        lbl_sc.setWordWrap(True)
+        lbl_sc.setStyleSheet("color: #9aa3b2; font-size: 8.5pt; border: none; background: transparent;")
+        sc_lay.addWidget(lbl_sc)
+        left_lay.addWidget(shortcuts_frame)
+
+        left_lay.addStretch()
+
+        # ----- PRAWA POŁOWA: KARAOKE / SYNCHRONIZOWANY TEKST -----
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(8, 4, 4, 4)
+        right_lay.setSpacing(6)
+
+        text_top = QHBoxLayout()
+        self.lbl_karaoke_header = QLabel("Tekst rozdziału (kliknij dowolną linijkę, aby skoczyć)")
+        self.lbl_karaoke_header.setStyleSheet("font-weight: bold; color: #cfd5df;")
+        text_top.addWidget(self.lbl_karaoke_header, 1)
+
+        self.chk_autoscroll = QCheckBox("Śledź tekst")
+        self.chk_autoscroll.setChecked(True)
+        text_top.addWidget(self.chk_autoscroll)
+
+        btn_font_minus = QPushButton("A-")
+        btn_font_minus.setFixedWidth(32)
+        btn_font_minus.setToolTip("Zmniejsz czcionkę tekstu")
+        btn_font_minus.clicked.connect(lambda: self._change_karaoke_font(-1))
+        btn_font_plus = QPushButton("A+")
+        btn_font_plus.setFixedWidth(32)
+        btn_font_plus.setToolTip("Powiększ czcionkę tekstu")
+        btn_font_plus.clicked.connect(lambda: self._change_karaoke_font(+1))
+        text_top.addWidget(btn_font_minus)
+        text_top.addWidget(btn_font_plus)
+        right_lay.addLayout(text_top)
+
+        self.list_karaoke = QListWidget()
+        self.list_karaoke.setWordWrap(True)
+        self.list_karaoke.setResizeMode(QListView.Adjust)
+        self.list_karaoke.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.list_karaoke.setSelectionMode(QAbstractItemView.NoSelection)
+        self.list_karaoke.setSpacing(3)
+        self.list_karaoke.setStyleSheet(
+            """
+            QListWidget {
+                background-color: #13161e;
+                border: 1px solid #2b3140;
+                border-radius: 6px;
+                padding: 8px;
+                outline: none;
+            }
+            QListWidget::item {
+                padding: 7px 10px;
+                border-radius: 5px;
+            }
+            QListWidget::item:hover {
+                background-color: #1e2433;
+            }
+            """
+        )
+        self.list_karaoke.itemClicked.connect(self._on_karaoke_item_clicked)
+        right_lay.addWidget(self.list_karaoke, 1)
+
+        text_bottom = QHBoxLayout()
+        self.btn_refresh_audio = QPushButton("🔄 Odśwież nowe fragmenty")
+        self.btn_refresh_audio.setToolTip("Wczytuje świeżo wygenerowane zdania z Zakładki 3 bez przerywania słuchania")
+        self.btn_refresh_audio.clicked.connect(self.refresh_new_chunks)
+
+        self.btn_fix_current = QPushButton("🔧 Popraw bieżący fragment (Zakładka 3)")
+        self.btn_fix_current.setToolTip(
+            "Zatrzymuje odtwarzanie i przechodzi dokładnie do tego zdania w Zakładce 3, aby poprawić tekst lub wymowę"
+        )
+        self.btn_fix_current.clicked.connect(self._on_fix_current_clicked)
+
+        text_bottom.addWidget(self.btn_refresh_audio)
+        text_bottom.addStretch()
+        text_bottom.addWidget(self.btn_fix_current)
+        right_lay.addLayout(text_bottom)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([540, 620])
+        root.addWidget(splitter, 1)
+
+    # =========================================================================
+    # ZARZĄDZANIE PROJEKTEM I OŚ CZASU
+    # =========================================================================
+    def set_project(self, db: ProjectDB | None) -> None:
+        """Podpina nowy projekt do odtwarzacza (albo czyści po usunięciu projektu)."""
+        self.persist_state()
+        self.release_media()
+        self.db = db
+        self._current_idx = -1
+        self._current_chapter_id = None
+        self._book_listened_sec = 0.0
+        self._session_listened_sec = 0.0
+        self._karaoke_chunk_to_row.clear()
+        self.list_karaoke.clear()
+
+        if db is None:
+            self._chapters = []
+            self._playable = []
+            self._playable_starts_ms = []
+            self._chunk_id_to_playable_idx.clear()
+            self._chapter_first_playable_idx.clear()
+            self._chapter_duration_ms.clear()
+            self._book_total_ms = 0
+            self.lbl_title.setText("Nie wczytano projektu")
+            self.lbl_author.setText("—")
+            self.lbl_cover.setPixmap(QPixmap())
+            self.lbl_cover.setText("Brak\nokładki")
+            self.combo_chapters.blockSignals(True)
+            self.combo_chapters.clear()
+            self.combo_chapters.blockSignals(False)
+            self.lbl_ready_info.setText("Wygenerowane fragmenty do odsłuchu: 0")
+            self._update_controls_enabled()
+            self._update_time_labels()
+            self._update_stats_display()
+            return
+
+        meta = db.get_all_meta()
+        self._refresh_book_header(meta)
+        try:
+            self._book_listened_sec = float(meta.get("player_listened_sec", "0") or 0.0)
+        except ValueError:
+            self._book_listened_sec = 0.0
+        try:
+            saved_speed = float(meta.get("player_speed", "1.0") or 1.0)
+            saved_speed = max(0.60, min(2.50, saved_speed))
+        except ValueError:
+            saved_speed = 1.0
+
+        self._playback_rate = saved_speed
+        self.spin_speed.blockSignals(True)
+        self.spin_speed.setValue(saved_speed)
+        self.spin_speed.blockSignals(False)
+
+        self._rebuild_timeline()
+
+        # Przywróć ostatnio słuchane zdanie i pozycję
+        saved_chunk_id = int(meta["player_chunk_id"]) if meta.get("player_chunk_id", "").isdigit() else None
+        saved_offset_ms = int(meta["player_offset_ms"]) if meta.get("player_offset_ms", "").isdigit() else 0
+
+        if self._playable:
+            start_idx = 0
+            if saved_chunk_id is not None and saved_chunk_id in self._chunk_id_to_playable_idx:
+                start_idx = self._chunk_id_to_playable_idx[saved_chunk_id]
+            else:
+                saved_offset_ms = 0
+            self._load_playable_index(start_idx, offset_ms=saved_offset_ms, autoplay=False)
+        else:
+            self._update_controls_enabled()
+            self._update_time_labels()
+
+        self._update_stats_display()
+
+    def refresh_metadata(self) -> None:
+        """Odświeża tytuł, autora i okładkę po edycji w Zakładce 1."""
+        if self.db is None:
+            return
+        self._refresh_book_header(self.db.get_all_meta())
+
+    def _refresh_book_header(self, meta: dict[str, str]) -> None:
+        title = meta.get("title") or (self.db.project_dir.name if self.db else "")
+        author = meta.get("author") or "Nieznany autor"
+        self.lbl_title.setText(title)
+        self.lbl_author.setText(author)
+
+        cover_path = Path(meta["cover_path"]) if meta.get("cover_path") else None
+        if cover_path and cover_path.exists():
+            pix = QPixmap(str(cover_path)).scaled(92, 130, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.lbl_cover.setPixmap(pix)
+        else:
+            self.lbl_cover.setPixmap(QPixmap())
+            self.lbl_cover.setText("Brak\nokładki")
+
+    def refresh_new_chunks(self) -> None:
+        """Doładowuje nowo wygenerowane chunki z bazy bez przerywania bieżącego odtwarzania."""
+        if self.db is None:
+            return
+        cur_chunk_id = self._playable[self._current_idx].chunk.id if 0 <= self._current_idx < len(self._playable) else None
+        old_count = len(self._playable)
+
+        self._rebuild_timeline()
+
+        if cur_chunk_id is not None and cur_chunk_id in self._chunk_id_to_playable_idx:
+            self._current_idx = self._chunk_id_to_playable_idx[cur_chunk_id]
+            if self._current_chapter_id is not None:
+                self._populate_karaoke_for_chapter(self._current_chapter_id, highlight_chunk_id=cur_chunk_id)
+        elif self._playable and self._current_idx < 0:
+            self._load_playable_index(0, offset_ms=0, autoplay=False)
+
+        self._update_controls_enabled()
+        self._update_time_labels()
+        self._update_stats_display()
+
+        diff = len(self._playable) - old_count
+        if diff > 0:
+            self.status_message.emit(f"Odtwarzacz: dodano {diff} nowych gotowych fragmentów")
+
+    def _rebuild_timeline(self) -> None:
+        if self.db is None:
+            return
+        self._chapters = self.db.list_chapters()
+        all_chunks = self.db.list_chunks(only_selected=False)
+
+        playable: list[_PlayableEntry] = []
+        starts_ms: list[int] = []
+        id_to_idx: dict[int, int] = {}
+        ch_first_idx: dict[int, int] = {}
+        ch_dur: dict[int, int] = {}
+
+        book_cursor = 0
+        ch_cursors: dict[int, int] = {}
+
+        for c in all_chunks:
+            if c.status != "done":
+                continue
+            ap = self.db.resolve_chunk_audio_path(c)
+            if ap is None:
+                continue
+            dur_ms = max(200, int(round(c.duration_sec * 1000))) if c.duration_sec > 0 else 1000
+            pause_ms = max(0, int(c.pause_after_ms))
+            ch_start = ch_cursors.get(c.chapter_id, 0)
+
+            entry = _PlayableEntry(
+                chunk=c,
+                audio_path=ap,
+                duration_ms=dur_ms,
+                pause_ms=pause_ms,
+                book_start_ms=book_cursor,
+                book_audio_end_ms=book_cursor + dur_ms,
+                book_end_ms=book_cursor + dur_ms + pause_ms,
+                ch_start_ms=ch_start,
+                ch_audio_end_ms=ch_start + dur_ms,
+                ch_end_ms=ch_start + dur_ms + pause_ms,
+            )
+            idx = len(playable)
+            playable.append(entry)
+            starts_ms.append(book_cursor)
+            id_to_idx[c.id] = idx
+            if c.chapter_id not in ch_first_idx:
+                ch_first_idx[c.chapter_id] = idx
+
+            book_cursor += dur_ms + pause_ms
+            ch_cursors[c.chapter_id] = ch_start + dur_ms + pause_ms
+            ch_dur[c.chapter_id] = ch_cursors[c.chapter_id]
+
+        self._playable = playable
+        self._playable_starts_ms = starts_ms
+        self._chunk_id_to_playable_idx = id_to_idx
+        self._chapter_first_playable_idx = ch_first_idx
+        self._chapter_duration_ms = ch_dur
+        self._book_total_ms = book_cursor
+
+        # Odśwież listę gotowych rozdziałów w combo
+        self.combo_chapters.blockSignals(True)
+        self.combo_chapters.clear()
+        ready_chapters = [ch for ch in self._chapters if ch.id in ch_first_idx]
+        for ch in ready_chapters:
+            dur_str = _fmt_mmss(ch_dur.get(ch.id, 0))
+            label = f"{ch.chapter_index + 1}. {ch.title}  ({ch.done_chunks}/{ch.total_chunks} • {dur_str})"
+            self.combo_chapters.addItem(label, ch.id)
+        if self._current_chapter_id is not None:
+            for i in range(self.combo_chapters.count()):
+                if self.combo_chapters.itemData(i) == self._current_chapter_id:
+                    self.combo_chapters.setCurrentIndex(i)
+                    break
+        self.combo_chapters.blockSignals(False)
+
+        self.lbl_ready_info.setText(
+            f"Gotowe do słuchania: {len(ready_chapters)} rozdz. • {len(playable)} fragm. "
+            f"(łącznie {_fmt_mmss(self._book_total_ms)})"
+        )
+
+    def release_media(self) -> None:
+        """Zatrzymuje odtwarzanie i zwalnia uchwyt pliku WAV w systemie Windows."""
+        self._pause_timer.stop()
+        self._in_pause_gap = False
+        self._is_playing = False
+        self._pending_autoplay = False
+        self._pending_seek_ms = None
+        self._last_tick_mono = None
+        self._player.stop()
+        self._player.setSource(QUrl())
+        self._current_source_path = None
+        QCoreApplication.processEvents()
+        self.btn_play_pause.setText("▶ Odtwórz")
+
+    def pause_playback(self) -> None:
+        """Pauzuje odtwarzanie (np. gdy użytkownik odpala podgląd w innej zakładce)."""
+        if not self._is_playing:
+            return
+        self._pause_timer.stop()
+        self._in_pause_gap = False
+        self._is_playing = False
+        self._pending_autoplay = False
+        self._last_tick_mono = None
+        self._player.pause()
+        self.btn_play_pause.setText("▶ Odtwórz")
+        self.persist_state()
+
+    # =========================================================================
+    # ODTWARZANIE, PRZEWIJANIE I KARAOKE
+    # =========================================================================
+    def _load_playable_index(self, idx: int, offset_ms: int = 0, autoplay: bool | None = None) -> None:
+        if not (0 <= idx < len(self._playable)):
+            return
+        should_play = self._is_playing if autoplay is None else autoplay
+        self._pause_timer.stop()
+        self._in_pause_gap = False
+        self._current_idx = idx
+
+        entry = self._playable[idx]
+        if entry.chunk.chapter_id != self._current_chapter_id:
+            self._current_chapter_id = entry.chunk.chapter_id
+            self._sync_chapter_combo(self._current_chapter_id)
+            self._populate_karaoke_for_chapter(self._current_chapter_id, highlight_chunk_id=entry.chunk.id)
+        else:
+            self._highlight_karaoke_chunk(entry.chunk.id)
+
+        clamped_offset = max(0, min(int(offset_ms), max(0, entry.duration_ms - 60)))
+        self._is_playing = should_play
+        self._last_tick_mono = time.monotonic() if should_play else None
+        self.btn_play_pause.setText("⏸ Pauza" if should_play else "▶ Odtwórz")
+
+        if not should_play:
+            # Leniwe ładowanie: nie otwieraj uchwytu pliku WAV w Windows dopóki użytkownik nie naciśnie Odtwórz
+            if self._current_source_path != entry.audio_path:
+                self._player.stop()
+                self._player.setSource(QUrl())
+                self._current_source_path = None
+                self._pending_seek_ms = clamped_offset
+                self._pending_autoplay = False
+            else:
+                self._pending_seek_ms = clamped_offset
+                self._pending_autoplay = False
+                self._player.pause()
+                self._player.setPosition(clamped_offset)
+        elif self._current_source_path == entry.audio_path and self._player.mediaStatus() in (
+            QMediaPlayer.LoadedMedia,
+            QMediaPlayer.BufferedMedia,
+            QMediaPlayer.EndOfMedia,
+        ):
+            self._pending_seek_ms = None
+            self._pending_autoplay = False
+            self._player.setPosition(clamped_offset)
+            self._player.setPlaybackRate(self._playback_rate)
+            self._player.play()
+        else:
+            self._current_source_path = entry.audio_path
+            self._pending_seek_ms = clamped_offset
+            self._pending_autoplay = True
+            self._player.setSource(QUrl.fromLocalFile(str(entry.audio_path)))
+
+        self._update_controls_enabled()
+        self._update_time_labels()
+        self._update_stats_display()
+
+    def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            if self._pending_seek_ms is not None:
+                pos = self._pending_seek_ms
+                self._pending_seek_ms = None
+                self._player.setPosition(pos)
+            self._player.setPlaybackRate(self._playback_rate)
+            if self._pending_autoplay:
+                self._pending_autoplay = False
+                if self._is_playing:
+                    self._player.play()
+        elif status == QMediaPlayer.EndOfMedia:
+            if not self._is_playing or self._in_pause_gap:
+                return
+            self._advance_after_chunk_end()
+
+    def _on_media_error(self, _error, error_string: str) -> None:
+        if error_string:
+            self.status_message.emit(f"Błąd odtwarzacza: {error_string}")
+
+    def _advance_after_chunk_end(self) -> None:
+        if self._current_idx < 0 or self._current_idx >= len(self._playable):
+            return
+        cur_entry = self._playable[self._current_idx]
+
+        # Jeśli doszliśmy do końca kolejki, sprawdź czy w międzyczasie wygenerowały się nowe chunki
+        if self._current_idx + 1 >= len(self._playable):
+            self.refresh_new_chunks()
+
+        if self._current_idx + 1 >= len(self._playable):
+            self._is_playing = False
+            self._last_tick_mono = None
+            self.btn_play_pause.setText("▶ Odtwórz")
+            self.persist_state()
+            self.status_message.emit("Dotarto do końca wygenerowanych fragmentów.")
+            return
+
+        next_entry = self._playable[self._current_idx + 1]
+        gap_ms = cur_entry.pause_ms
+        if next_entry.chunk.chapter_id != cur_entry.chunk.chapter_id:
+            gap_ms = max(gap_ms, 1200)
+
+        scaled_gap_ms = int(round(gap_ms / max(0.5, self._playback_rate)))
+        if scaled_gap_ms >= 35:
+            self._in_pause_gap = True
+            self._pause_gap_start_mono = time.monotonic()
+            self._pause_gap_duration_ms = gap_ms
+            self._pause_timer.start(scaled_gap_ms)
+        else:
+            self._load_playable_index(self._current_idx + 1, offset_ms=0, autoplay=True)
+
+    def _on_pause_gap_finished(self) -> None:
+        self._in_pause_gap = False
+        if not self._is_playing:
+            return
+        if self._current_idx + 1 < len(self._playable):
+            self._load_playable_index(self._current_idx + 1, offset_ms=0, autoplay=True)
+
+    def toggle_play_pause(self) -> None:
+        if not self._playable:
+            self.refresh_new_chunks()
+            if not self._playable:
+                return
+        if self._is_playing:
+            self.pause_playback()
+            return
+
+        # Wznów lub wystartuj
+        if self._current_idx < 0:
+            self._load_playable_index(0, offset_ms=0, autoplay=True)
+            return
+
+        # Jeśli poprzedni chunk już się skończył i pauza została wciśnięta w przerwie, idź do kolejnego
+        if self._player.mediaStatus() == QMediaPlayer.EndOfMedia:
+            if self._current_idx + 1 < len(self._playable):
+                self._load_playable_index(self._current_idx + 1, offset_ms=0, autoplay=True)
+            else:
+                self._load_playable_index(self._current_idx, offset_ms=0, autoplay=True)
+            return
+
+        self._is_playing = True
+        self._last_tick_mono = time.monotonic()
+        self.btn_play_pause.setText("⏸ Pauza")
+        if self._current_source_path is None:
+            resume_ms = self._pending_seek_ms if self._pending_seek_ms is not None else 0
+            self._load_playable_index(self._current_idx, offset_ms=resume_ms, autoplay=True)
+        else:
+            self._player.setPlaybackRate(self._playback_rate)
+            self._player.play()
+
+    def current_book_ms(self) -> int:
+        if not (0 <= self._current_idx < len(self._playable)):
+            return 0
+        entry = self._playable[self._current_idx]
+        if self._in_pause_gap:
+            elapsed_ms = int((time.monotonic() - self._pause_gap_start_mono) * 1000.0 * self._playback_rate)
+            return entry.book_audio_end_ms + min(entry.pause_ms, max(0, elapsed_ms))
+        if self._pending_seek_ms is not None:
+            return entry.book_start_ms + min(entry.duration_ms, max(0, self._pending_seek_ms))
+        pos = max(0, int(self._player.position()))
+        return entry.book_start_ms + min(entry.duration_ms, pos)
+
+    def current_chapter_ms(self) -> int:
+        if not (0 <= self._current_idx < len(self._playable)):
+            return 0
+        entry = self._playable[self._current_idx]
+        if self._in_pause_gap:
+            elapsed_ms = int((time.monotonic() - self._pause_gap_start_mono) * 1000.0 * self._playback_rate)
+            return entry.ch_audio_end_ms + min(entry.pause_ms, max(0, elapsed_ms))
+        if self._pending_seek_ms is not None:
+            return entry.ch_start_ms + min(entry.duration_ms, max(0, self._pending_seek_ms))
+        pos = max(0, int(self._player.position()))
+        return entry.ch_start_ms + min(entry.duration_ms, pos)
+
+    def seek_relative_ms(self, delta_ms: int) -> None:
+        if not self._playable:
+            return
+        if self._current_idx < 0:
+            self._load_playable_index(0, offset_ms=0, autoplay=False)
+            return
+        target = self.current_book_ms() + int(delta_ms)
+        self.seek_to_book_ms(target)
+
+    def seek_to_book_ms(self, target_ms: int) -> None:
+        if not self._playable:
+            return
+        clamped = max(0, min(int(target_ms), max(0, self._book_total_ms - 80)))
+        idx = bisect.bisect_right(self._playable_starts_ms, clamped) - 1
+        idx = max(0, min(idx, len(self._playable) - 1))
+        entry = self._playable[idx]
+        offset_ms = max(0, min(clamped - entry.book_start_ms, max(0, entry.duration_ms - 80)))
+        self._load_playable_index(idx, offset_ms=offset_ms, autoplay=self._is_playing)
+        self.persist_state()
+
+    def seek_to_chapter_ms(self, target_ch_ms: int) -> None:
+        if not self._playable or self._current_chapter_id is None:
+            return
+        first_idx = self._chapter_first_playable_idx.get(self._current_chapter_id)
+        if first_idx is None:
+            return
+        ch_book_base = self._playable[first_idx].book_start_ms
+        ch_dur = self._chapter_duration_ms.get(self._current_chapter_id, 0)
+        clamped_ch = max(0, min(int(target_ch_ms), max(0, ch_dur - 80)))
+        self.seek_to_book_ms(ch_book_base + clamped_ch)
+
+    def prev_chapter(self) -> None:
+        idx = self.combo_chapters.currentIndex()
+        if idx > 0:
+            self.combo_chapters.setCurrentIndex(idx - 1)
+
+    def next_chapter(self) -> None:
+        idx = self.combo_chapters.currentIndex()
+        if 0 <= idx < self.combo_chapters.count() - 1:
+            self.combo_chapters.setCurrentIndex(idx + 1)
+
+    def _sync_chapter_combo(self, chapter_id: int) -> None:
+        self.combo_chapters.blockSignals(True)
+        for i in range(self.combo_chapters.count()):
+            if self.combo_chapters.itemData(i) == chapter_id:
+                self.combo_chapters.setCurrentIndex(i)
+                break
+        self.combo_chapters.blockSignals(False)
+
+    def _on_chapter_combo_changed(self, combo_idx: int) -> None:
+        if combo_idx < 0:
+            return
+        ch_id = self.combo_chapters.itemData(combo_idx)
+        if ch_id is None or ch_id not in self._chapter_first_playable_idx:
+            return
+        target_idx = self._chapter_first_playable_idx[ch_id]
+        self._load_playable_index(target_idx, offset_ms=0, autoplay=self._is_playing)
+        self.persist_state()
+
+    # =========================================================================
+    # TEMPO I GŁOŚNOŚĆ
+    # =========================================================================
+    def set_playback_rate(self, rate: float) -> None:
+        clamped = round(max(0.60, min(2.50, float(rate))), 2)
+        self.spin_speed.setValue(clamped)
+
+    def adjust_playback_rate(self, delta: float) -> None:
+        self.set_playback_rate(self._playback_rate + delta)
+
+    def _on_speed_changed(self, val: float) -> None:
+        self._playback_rate = round(float(val), 2)
+        self._player.setPlaybackRate(self._playback_rate)
+        self._update_stats_display()
+        self.persist_state()
+
+    def _on_volume_changed(self, val: int) -> None:
+        self._audio_out.setVolume(max(0.0, min(1.0, val / 100.0)))
+        self.lbl_volume.setText(f"{val}%")
+        if val > 0 and self._muted:
+            self._muted = False
+            self._audio_out.setMuted(False)
+            self.btn_mute.setText("🔊")
+
+    def _on_toggle_mute(self) -> None:
+        self._muted = not self._muted
+        self._audio_out.setMuted(self._muted)
+        self.btn_mute.setText("🔇" if self._muted else "🔊")
+
+    # =========================================================================
+    # SUWAK ROZDZIAŁU I TICK UI
+    # =========================================================================
+    def _on_slider_pressed(self) -> None:
+        self._slider_dragging = True
+
+    def _on_slider_moved(self, val: int) -> None:
+        if self._current_chapter_id is None:
+            return
+        ch_dur = self._chapter_duration_ms.get(self._current_chapter_id, 0)
+        preview_ms = int(round(ch_dur * (val / 1000.0)))
+        self.lbl_ch_elapsed.setText(_fmt_mmss(preview_ms))
+        self.lbl_ch_pct.setText(f"Rozdział: {val / 10.0:.0f}%")
+
+    def _on_slider_released(self) -> None:
+        self._slider_dragging = False
+        if self._current_chapter_id is None:
+            return
+        ch_dur = self._chapter_duration_ms.get(self._current_chapter_id, 0)
+        target_ms = int(round(ch_dur * (self.slider_chapter.value() / 1000.0)))
+        self.seek_to_chapter_ms(target_ms)
+
+    def _on_ui_tick(self) -> None:
+        now = time.monotonic()
+        if self._is_playing:
+            if self._last_tick_mono is not None:
+                dt = max(0.0, min(1.0, now - self._last_tick_mono))
+                self._accumulate_listening_time(dt)
+            self._last_tick_mono = now
+            if now - self._last_persist_mono >= 10.0:
+                self.persist_state()
+                self._last_persist_mono = now
+            self._update_time_labels()
+            self._update_stats_display()
+        else:
+            self._last_tick_mono = None
+
+    def _update_time_labels(self) -> None:
+        if not self._playable or not (0 <= self._current_idx < len(self._playable)):
+            self.lbl_ch_elapsed.setText("00:00")
+            self.lbl_ch_total.setText("00:00")
+            self.lbl_ch_pct.setText("Rozdział: 0%")
+            self.lbl_book_time.setText("00:00 / 00:00")
+            self.bar_book_progress.setValue(0)
+            if not self._slider_dragging:
+                self.slider_chapter.setValue(0)
+            return
+
+        ch_id = self._playable[self._current_idx].chunk.chapter_id
+        ch_dur = max(1, self._chapter_duration_ms.get(ch_id, 1))
+        ch_pos = min(ch_dur, self.current_chapter_ms())
+
+        if not self._slider_dragging:
+            self.slider_chapter.setValue(int(round(1000.0 * ch_pos / ch_dur)))
+            self.lbl_ch_elapsed.setText(_fmt_mmss(ch_pos))
+            self.lbl_ch_pct.setText(f"Rozdział: {100.0 * ch_pos / ch_dur:.0f}%")
+        self.lbl_ch_total.setText(_fmt_mmss(ch_dur))
+
+        book_dur = max(1, self._book_total_ms)
+        book_pos = min(book_dur, self.current_book_ms())
+        self.bar_book_progress.setValue(int(round(1000.0 * book_pos / book_dur)))
+        self.lbl_book_time.setText(f"{_fmt_mmss(book_pos)} / {_fmt_mmss(book_dur)}")
+
+    def _update_controls_enabled(self) -> None:
+        has_audio = len(self._playable) > 0
+        for w in (
+            self.btn_play_pause,
+            self.btn_back_10,
+            self.btn_back_60,
+            self.btn_fwd_10,
+            self.btn_fwd_60,
+            self.slider_chapter,
+            self.combo_chapters,
+            self.btn_prev_chapter,
+            self.btn_next_chapter,
+            self.btn_fix_current,
+        ):
+            w.setEnabled(has_audio)
+        self.btn_refresh_audio.setEnabled(self.db is not None)
+
+    # =========================================================================
+    # KARAOKE TEKSTU
+    # =========================================================================
+    def _populate_karaoke_for_chapter(self, chapter_id: int, highlight_chunk_id: int | None = None) -> None:
+        if self.db is None:
+            return
+        chunks = self.db.list_chunks(chapter_id=chapter_id)
+        self.list_karaoke.clear()
+        self._karaoke_chunk_to_row.clear()
+
+        ch_title = chunks[0].chapter_title if chunks else ""
+        self.lbl_karaoke_header.setText(f"Tekst: {ch_title}  (kliknij zdanie, aby skoczyć)")
+
+        base_font = QFont()
+        base_font.setPointSize(self._karaoke_font_pt)
+
+        for row_idx, c in enumerate(chunks):
+            txt = (c.raw_text or c.normalized_text).strip()
+            is_ready = c.id in self._chunk_id_to_playable_idx
+            item = QListWidgetItem(txt)
+            item.setData(Qt.UserRole, c.id)
+            item.setData(Qt.UserRole + 1, is_ready)
+            item.setFont(base_font)
+            if is_ready:
+                item.setForeground(QBrush(QColor("#cfd6e2")))
+                item.setToolTip(f"Fragment #{c.chunk_index + 1} ({c.duration_sec:.1f}s) — kliknij, aby odtworzyć stąd")
+            else:
+                item.setForeground(QBrush(QColor("#596273")))
+                f_it = QFont(base_font)
+                f_it.setItalic(True)
+                item.setFont(f_it)
+                item.setToolTip(f"Fragment #{c.chunk_index + 1} — jeszcze nie wygenerowano")
+            self.list_karaoke.addItem(item)
+            self._karaoke_chunk_to_row[c.id] = row_idx
+
+        if highlight_chunk_id is not None:
+            self._highlight_karaoke_chunk(highlight_chunk_id)
+
+    def _highlight_karaoke_chunk(self, active_chunk_id: int) -> None:
+        active_row = self._karaoke_chunk_to_row.get(active_chunk_id)
+        if active_row is None:
+            return
+
+        base_font = QFont()
+        base_font.setPointSize(self._karaoke_font_pt)
+        active_font = QFont(base_font)
+        active_font.setBold(True)
+        pending_font = QFont(base_font)
+        pending_font.setItalic(True)
+
+        for row in range(self.list_karaoke.count()):
+            item = self.list_karaoke.item(row)
+            if item is None:
+                continue
+            is_ready = bool(item.data(Qt.UserRole + 1))
+            if row == active_row:
+                item.setBackground(QBrush(QColor("#1f3b66")))
+                item.setForeground(QBrush(QColor("#ffffff")))
+                item.setFont(active_font)
+            elif not is_ready:
+                item.setBackground(QBrush(Qt.transparent))
+                item.setForeground(QBrush(QColor("#596273")))
+                item.setFont(pending_font)
+            elif row < active_row:
+                item.setBackground(QBrush(Qt.transparent))
+                item.setForeground(QBrush(QColor("#808a9b")))
+                item.setFont(base_font)
+            else:
+                item.setBackground(QBrush(Qt.transparent))
+                item.setForeground(QBrush(QColor("#dce2ec")))
+                item.setFont(base_font)
+
+        if self.chk_autoscroll.isChecked():
+            active_item = self.list_karaoke.item(active_row)
+            if active_item is not None:
+                self.list_karaoke.scrollToItem(active_item, QAbstractItemView.PositionAtCenter)
+
+    def _on_karaoke_item_clicked(self, item: QListWidgetItem) -> None:
+        chunk_id = item.data(Qt.UserRole)
+        if chunk_id is None:
+            return
+        if chunk_id not in self._chunk_id_to_playable_idx:
+            # Może właśnie się wygenerował? Spróbuj odświeżyć
+            self.refresh_new_chunks()
+        if chunk_id not in self._chunk_id_to_playable_idx:
+            self.status_message.emit("Ten fragment nie został jeszcze wygenerowany.")
+            return
+        target_idx = self._chunk_id_to_playable_idx[chunk_id]
+        self._load_playable_index(target_idx, offset_ms=0, autoplay=True)
+        self.persist_state()
+
+    def _change_karaoke_font(self, delta: int) -> None:
+        self._karaoke_font_pt = max(9, min(22, self._karaoke_font_pt + delta))
+        if self._current_chapter_id is not None:
+            cur_id = self._playable[self._current_idx].chunk.id if 0 <= self._current_idx < len(self._playable) else None
+            self._populate_karaoke_for_chapter(self._current_chapter_id, highlight_chunk_id=cur_id)
+
+    def _on_fix_current_clicked(self) -> None:
+        if not (0 <= self._current_idx < len(self._playable)):
+            return
+        chunk_id = self._playable[self._current_idx].chunk.id
+        self.pause_playback()
+        self.edit_chunk_requested.emit(chunk_id)
+
+    # =========================================================================
+    # STATYSTYKI SŁUCHANIA I ZAPIS STANU
+    # =========================================================================
+    def _load_global_stats(self) -> dict:
+        if self._stats_path.exists():
+            try:
+                data = json.loads(self._stats_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data.setdefault("total_listened_sec", 0.0)
+                    data.setdefault("daily_sec", {})
+                    return data
+            except Exception:
+                pass
+        return {"total_listened_sec": 0.0, "daily_sec": {}}
+
+    def _accumulate_listening_time(self, dt_sec: float) -> None:
+        if dt_sec <= 0:
+            return
+        today_key = date.today().isoformat()
+        self._session_listened_sec += dt_sec
+        self._book_listened_sec += dt_sec
+        self._global_stats["total_listened_sec"] = float(self._global_stats.get("total_listened_sec", 0.0)) + dt_sec
+        daily = self._global_stats.setdefault("daily_sec", {})
+        daily[today_key] = float(daily.get(today_key, 0.0)) + dt_sec
+
+    def _update_stats_display(self) -> None:
+        today_key = date.today().isoformat()
+        today_sec = float(self._global_stats.get("daily_sec", {}).get(today_key, 0.0))
+        total_sec = float(self._global_stats.get("total_listened_sec", 0.0))
+
+        self.lbl_stats_main.setText(
+            f"Dzisiaj: {_fmt_duration_human(today_sec)}  •  "
+            f"Ta książka: {_fmt_duration_human(self._book_listened_sec)}  •  "
+            f"Łącznie: {_fmt_duration_human(total_sec)}"
+        )
+
+        if self._book_total_ms > 0 and 0 <= self._current_idx < len(self._playable):
+            pos_ms = self.current_book_ms()
+            pct = 100.0 * pos_ms / max(1, self._book_total_ms)
+            rem_audio_sec = max(0.0, (self._book_total_ms - pos_ms) / 1000.0)
+            rem_real_sec = rem_audio_sec / max(0.5, self._playback_rate)
+            self.lbl_stats_sub.setText(
+                f"Odsłuchano: {pct:.1f}%  •  Pozostało do końca gotowego audio: "
+                f"~{_fmt_duration_human(rem_real_sec)} (przy {self._playback_rate:.2f}x)"
+            )
+        else:
+            self.lbl_stats_sub.setText("Pozostało do końca gotowego audio: —")
+
+    def persist_state(self) -> None:
+        """Zapisuje ostatnią pozycję w książce (SQLite) oraz globalne statystyki słuchania (JSON)."""
+        try:
+            self._stats_path.parent.mkdir(parents=True, exist_ok=True)
+            self._global_stats["last_updated"] = datetime.now().isoformat(timespec="seconds")
+            self._stats_path.write_text(
+                json.dumps(self._global_stats, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        if self.db is not None and self.db.db_path.exists():
+            try:
+                self.db.set_meta("player_listened_sec", f"{self._book_listened_sec:.1f}")
+                self.db.set_meta("player_speed", f"{self._playback_rate:.2f}")
+                if 0 <= self._current_idx < len(self._playable):
+                    entry = self._playable[self._current_idx]
+                    offset_ms = max(0, self.current_book_ms() - entry.book_start_ms)
+                    self.db.set_meta("player_chunk_id", str(entry.chunk.id))
+                    self.db.set_meta("player_offset_ms", str(min(offset_ms, entry.duration_ms)))
+            except Exception:
+                pass

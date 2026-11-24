@@ -10,9 +10,11 @@ import winsound
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -35,6 +37,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -48,6 +51,7 @@ from f5_audiobook.config import (
     save_pronunciation_dict,
 )
 from f5_audiobook.engine.f5_ipa import F5IpaEngine
+from f5_audiobook.gui.player_widget import AudiobookPlayerWidget
 from f5_audiobook.gui.workers import (
     BatchWorker,
     ExportWorker,
@@ -133,7 +137,10 @@ class MainWindow(QMainWindow):
         self._build_voice_tab()
         self._build_generation_tab()
         self._build_pronunciation_tab()
+        self._build_player_tab()
         self._build_global_status_bar()
+        self._setup_player_shortcuts()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self._refresh_saved_projects()
         self._refresh_voices()
@@ -870,6 +877,84 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "4. Słownik Wymowy")
 
     # =========================================================================
+    # ZAKŁADKA 5: ODTWARZACZ AUDIOBOOKÓW (Z KARAOKE TEKSTU)
+    # =========================================================================
+    def _build_player_tab(self) -> None:
+        self.player_widget = AudiobookPlayerWidget(self)
+        self.player_widget.edit_chunk_requested.connect(self._on_player_edit_chunk)
+        self.player_widget.status_message.connect(lambda msg: self.lbl_global_status.setText(msg))
+        self.tabs.addTab(self.player_widget, "5. Odtwarzacz")
+
+    def _is_text_input_focused(self) -> bool:
+        w = QApplication.focusWidget()
+        return isinstance(w, (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox))
+
+    def _run_player_shortcut(self, fn, require_player_tab: bool = False, ignore_text_focus: bool = False) -> None:
+        if require_player_tab and self.tabs.currentWidget() is not self.player_widget:
+            return
+        if not ignore_text_focus and self._is_text_input_focused():
+            return
+        fn()
+
+    def _setup_player_shortcuts(self) -> None:
+        self._player_shortcuts: list[QShortcut] = []
+
+        def _add(seq, fn, require_player_tab: bool = False, ignore_text_focus: bool = False) -> None:
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.WindowShortcut)
+            sc.activated.connect(
+                lambda: self._run_player_shortcut(
+                    fn,
+                    require_player_tab=require_player_tab,
+                    ignore_text_focus=ignore_text_focus,
+                )
+            )
+            self._player_shortcuts.append(sc)
+
+        # Globalne skróty działające w całym aktywnym oknie aplikacji (niezależnie od zakładki)
+        _add("Ctrl+Space", self.player_widget.toggle_play_pause, ignore_text_focus=True)
+        _add("Ctrl+Left", lambda: self.player_widget.seek_relative_ms(-10_000))
+        _add("Ctrl+Right", lambda: self.player_widget.seek_relative_ms(10_000))
+        _add("Ctrl+Shift+Left", lambda: self.player_widget.seek_relative_ms(-60_000))
+        _add("Ctrl+Shift+Right", lambda: self.player_widget.seek_relative_ms(60_000))
+
+        # Klawisze multimedialne klawiatury (zawsze aktywne)
+        _add(Qt.Key_MediaTogglePlayPause, self.player_widget.toggle_play_pause, ignore_text_focus=True)
+        _add(Qt.Key_MediaPlay, self.player_widget.toggle_play_pause, ignore_text_focus=True)
+        _add(Qt.Key_MediaPause, self.player_widget.pause_playback, ignore_text_focus=True)
+        _add(Qt.Key_MediaPrevious, lambda: self.player_widget.seek_relative_ms(-10_000), ignore_text_focus=True)
+        _add(Qt.Key_MediaNext, lambda: self.player_widget.seek_relative_ms(10_000), ignore_text_focus=True)
+
+        # Szybkie pojedyncze klawisze aktywne na Zakładce 5 (Odtwarzacz)
+        _add(Qt.Key_Space, self.player_widget.toggle_play_pause, require_player_tab=True)
+        _add(Qt.Key_Left, lambda: self.player_widget.seek_relative_ms(-10_000), require_player_tab=True)
+        _add(Qt.Key_Right, lambda: self.player_widget.seek_relative_ms(10_000), require_player_tab=True)
+        _add("Shift+Left", lambda: self.player_widget.seek_relative_ms(-60_000), require_player_tab=True)
+        _add("Shift+Right", lambda: self.player_widget.seek_relative_ms(60_000), require_player_tab=True)
+        _add("[", lambda: self.player_widget.adjust_playback_rate(-0.05), require_player_tab=True)
+        _add("]", lambda: self.player_widget.adjust_playback_rate(+0.05), require_player_tab=True)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.player_widget and self.db is not None:
+            self.player_widget.refresh_new_chunks()
+
+    def _on_player_edit_chunk(self, chunk_id: int) -> None:
+        """Przechodzi z Odtwarzacza dokładnie do wskazanego fragmentu w Zakładce 3."""
+        self.tabs.setCurrentIndex(2)
+        if chunk_id not in self._chunk_id_to_row:
+            self.combo_chunk_filter.setCurrentIndex(0)
+            self._refresh_chunks_table()
+        row = self._chunk_id_to_row.get(chunk_id)
+        if row is not None and 0 <= row < self.tbl_chunks.rowCount():
+            self.tbl_chunks.selectRow(row)
+            item = self.tbl_chunks.item(row, 5)
+            if item is not None:
+                self.tbl_chunks.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            self.lbl_global_status.setText(
+                "Zaznaczono fragment z odtwarzacza — kliknij 2x tekst, aby poprawić, lub kliknij Regeneruj."
+            )
+
+    # =========================================================================
     # LOGIKA: KSIĄŻKI I PROJEKTY
     # =========================================================================
     def _log(self, msg: str) -> None:
@@ -996,6 +1081,7 @@ class MainWindow(QMainWindow):
         # Jeśli usuwamy aktualnie otwarty projekt, najpierw czyścimy UI i zatrzymujemy odsłuch
         if self.db is not None and self.db.project_dir.resolve() == proj_dir.resolve():
             _stop_wav_playback()
+            self.player_widget.set_project(None)
             self.db = None
             self._saved_book_meta = ("", "", "")
             for ed in (self.ed_book_title, self.ed_book_author, self.ed_project_name):
@@ -1136,6 +1222,8 @@ class MainWindow(QMainWindow):
 
             try:
                 _stop_wav_playback()
+                self.player_widget.persist_state()
+                self.player_widget.release_media()
                 self.db.rename_project(new_proj_slug)
                 renamed = True
             except Exception as e:
@@ -1163,6 +1251,7 @@ class MainWindow(QMainWindow):
         if renamed:
             self._refresh_saved_projects(select_dir=self.db.project_dir)
             self._refresh_chunks_table()
+            self.player_widget.set_project(self.db)
             self._log(
                 f"Zapisano dane książki i zmieniono projekt: {old_proj_name} → {self.db.project_dir.name} "
                 f"(„{new_title}” — {new_author})."
@@ -1171,6 +1260,7 @@ class MainWindow(QMainWindow):
                 f"Zapisano: „{new_title}” ({new_author}) | projekt: {self.db.project_dir.name}"
             )
         else:
+            self.player_widget.refresh_metadata()
             self._log(f"Zapisano metadane książki: „{new_title}” — {new_author}.")
             self.lbl_global_status.setText(f"Zapisano metadane książki: „{new_title}” ({new_author})")
 
@@ -1189,6 +1279,7 @@ class MainWindow(QMainWindow):
             dest = self.db.set_cover_image(Path(fpath))
             pix = QPixmap(str(dest)).scaled(96, 126, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.lbl_cover.setPixmap(pix)
+            self.player_widget.refresh_metadata()
             self._log(f"Zaktualizowano okładkę projektu: {dest.name}")
             self.lbl_global_status.setText(f"Zaktualizowano okładkę: {dest.name}")
         except Exception as e:
@@ -1226,6 +1317,7 @@ class MainWindow(QMainWindow):
         self._refresh_chapters_table()
         self._refresh_chunks_table()
         self._update_progress_widgets()
+        self.player_widget.set_project(self.db)
 
     def _refresh_chapters_table(self) -> None:
         if self.db is None:
@@ -1872,6 +1964,7 @@ class MainWindow(QMainWindow):
         self._update_progress_widgets(prog)
         self._refresh_chapters_table()
         self._refresh_chunks_table()
+        self.player_widget.refresh_new_chunks()
         self._log(prog.message)
 
     def _on_batch_failed(self, err: str) -> None:
@@ -1901,6 +1994,7 @@ class MainWindow(QMainWindow):
         if p is None or not p.exists():
             QMessageBox.information(self, "Brak audio", "Zaznaczony fragment nie ma jeszcze pliku WAV.")
             return
+        self.player_widget.pause_playback()
         _play_wav_async(p)
 
     def _on_regenerate_selected_chunk(self) -> None:
@@ -1915,6 +2009,8 @@ class MainWindow(QMainWindow):
         if voice is None:
             return
 
+        self.player_widget.persist_state()
+        self.player_widget.release_media()
         self.btn_regen_chunk.setEnabled(False)
         self._log(f"Regeneruję fragment #{c.chunk_index + 1} ({c.chapter_title})...")
 
@@ -1935,6 +2031,7 @@ class MainWindow(QMainWindow):
         self.btn_regen_chunk.setEnabled(True)
         self._refresh_chunks_table()
         self._update_progress_widgets()
+        self.player_widget.refresh_new_chunks()
         self._log(f"Zregenerowano #{updated.chunk_index + 1} (seed={updated.seed}, {updated.duration_sec:.1f}s)")
         if updated.audio_path:
             _play_wav_async(Path(updated.audio_path))
@@ -2073,6 +2170,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         _stop_wav_playback()
+        self.player_widget.persist_state()
+        self.player_widget.release_media()
         if self.batch_worker and self.batch_worker.isRunning():
             self.batch_worker.request_stop()
             self.batch_worker.wait(5000)
