@@ -20,6 +20,9 @@ from tokenizers import Tokenizer
 from f5_audiobook.config import MULTI3_MODEL_DIR, VOCODER_DIR
 
 _ESPEAK_INITIALIZED = False
+_BPE_SPLIT_MARK = "\u2060"
+_AFFRICATE_TXT_RE = re.compile(r"trz|drz|cz|dż|tsz|dsz", re.IGNORECASE)
+_AFFRICATE_IPA_RE = re.compile(r"tʃ|dʒ")
 
 
 def init_espeak() -> None:
@@ -31,7 +34,42 @@ def init_espeak() -> None:
     _ESPEAK_INITIALIZED = True
 
 
-def text_to_ipa_pl(text: str) -> str:
+def mark_polish_trz_drz(text: str, ipa: str) -> str:
+    """Wstawia znacznik rozbicia BPE tylko w tʃ z 'trz' i dʒ z 'drz' (nie rusza 'cz'/'dż')."""
+    if not re.search(r"trz|drz", text, re.IGNORECASE):
+        return ipa
+
+    src_matches = [m.group(0).lower() for m in _AFFRICATE_TXT_RE.finditer(text)]
+    ipa_matches = list(_AFFRICATE_IPA_RE.finditer(ipa))
+    if len(src_matches) == len(ipa_matches):
+        out = ipa
+        for kind, m in reversed(list(zip(src_matches, ipa_matches))):
+            if kind in ("trz", "drz"):
+                sym = m.group(0)
+                out = out[: m.start()] + f"{sym[0]}{_BPE_SPLIT_MARK}{sym[1]}" + out[m.end() :]
+        return out
+
+    # Fallback: jeśli w zdaniu nie ma żadnych 'cz'/'dż', rozbij bezpiecznie wszystkie tʃ/dʒ
+    out = ipa
+    if re.search(r"trz", text, re.IGNORECASE) and not re.search(r"cz", text, re.IGNORECASE):
+        out = out.replace("tʃ", f"t{_BPE_SPLIT_MARK}ʃ")
+    if re.search(r"drz", text, re.IGNORECASE) and not re.search(r"dż", text, re.IGNORECASE):
+        out = out.replace("dʒ", f"d{_BPE_SPLIT_MARK}ʒ")
+    return out
+
+
+def encode_marked_ipa(tokenizer: Tokenizer, marked_ipa: str) -> list[int]:
+    """Koduje IPA do ID tokenów BPE, wymuszając granicę tokenu w miejscach _BPE_SPLIT_MARK."""
+    if _BPE_SPLIT_MARK not in marked_ipa:
+        return tokenizer.encode(marked_ipa).ids
+    ids: list[int] = []
+    for seg in marked_ipa.split(_BPE_SPLIT_MARK):
+        if seg:
+            ids.extend(tokenizer.encode(seg).ids)
+    return ids
+
+
+def text_to_ipa_pl(text: str, mark_clusters: bool = False) -> str:
     init_espeak()
     ipa = phonemize(
         text,
@@ -44,10 +82,16 @@ def text_to_ipa_pl(text: str) -> str:
     # Usuwamy tagi przełączania języka np. (en), (pl) oraz znak przedłużenia 'ː'
     ipa = re.sub(r"\([a-z]{2,3}\)", "", ipa)
     ipa = ipa.replace("ː", "")
+    # Usuwamy akcent poboczny 'ˌ' bezpośrednio po tʃ/dʒ (np. czyściciele: tʃˌɨ -> tʃɨ),
+    # aby BPE zachowało pełny polski token sylabowy 'tʃɨ' zamiast gołego 'tʃ'
+    ipa = re.sub(r"(tʃ|dʒ)ˌ", r"\1", ipa)
     # Zapobiega zlewaniu grupy końcowej '-tr' przed dźwięczną (np. "Wiatr znowu" -> espeak daje vʲˈadr zamiast vʲˈatr)
     if re.search(r"tr(?=\s)", text, re.IGNORECASE):
         ipa = re.sub(r"dr(?=\s)", "tr", ipa)
-    return re.sub(r"\s+", " ", ipa).strip()
+    ipa = re.sub(r"\s+", " ", ipa).strip()
+    if mark_clusters:
+        ipa = mark_polish_trz_drz(text, ipa)
+    return ipa
 
 
 def trim_silence(
@@ -244,7 +288,7 @@ class F5IpaEngine:
 
         self._ref_audio_tensor = audio.to(self.device)
         self._ref_rms = rms
-        self._ref_ipa = text_to_ipa_pl(ref_text)
+        self._ref_ipa = text_to_ipa_pl(ref_text, mark_clusters=True)
         self._ref_cache_key = cache_key
 
     def synthesize(
@@ -264,15 +308,16 @@ class F5IpaEngine:
         self._prepare_reference(ref_audio_path, ref_text)
         assert self._ref_audio_tensor is not None
 
-        ipa_gen = text_to_ipa_pl(text)
+        ipa_gen_marked = text_to_ipa_pl(text, mark_clusters=True)
+        ipa_gen = ipa_gen_marked.replace(_BPE_SPLIT_MARK, "")
         if not ipa_gen:
             raise ValueError(f"Pusta transkrypcja IPA dla tekstu: {text!r}")
 
-        full_ipa = f"{self._ref_ipa} {ipa_gen}"
-        enc = self._tokenizer.encode(full_ipa)
+        full_ipa_marked = f"{self._ref_ipa} {ipa_gen_marked}"
+        token_ids = encode_marked_ipa(self._tokenizer, full_ipa_marked)
 
         ref_audio_len = self._ref_audio_tensor.shape[-1] // self.hop_length
-        ref_ipa_len = max(1, len(self._ref_ipa))
+        ref_ipa_len = max(1, len(self._ref_ipa.replace(_BPE_SPLIT_MARK, "")))
         gen_ipa_len = max(1, len(ipa_gen))
 
         # Bardzo krótkie frazy dostają lekki zapas czasu, żeby nie ucinało końcówek
@@ -286,7 +331,7 @@ class F5IpaEngine:
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
 
-        text_ids = torch.tensor([enc.ids], dtype=torch.long, device=self.device)
+        text_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
 
         with torch.inference_mode():
             generated, _ = self._tts.ema_model.sample(

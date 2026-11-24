@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
+
+# Natywny backend Windows Media Foundation (ten sam silnik audio co Windows Media Player):
+# brak problemów z Bluetooth A2DP / 24 kHz mono i brak komunikatów FFmpeg na konsoli.
+if sys.platform == "win32":
+    os.environ.setdefault("QT_MEDIA_BACKEND", "windows")
 
 from PySide6.QtWidgets import QApplication
 
@@ -60,7 +66,8 @@ QPushButton:hover {
 }
 QPushButton:disabled {
     background-color: #20232a;
-    color: #636b78;
+    border-color: #2b303a;
+    color: #5d6573;
 }
 QPushButton#primaryBtn {
     background-color: #2d6cdf;
@@ -71,10 +78,26 @@ QPushButton#primaryBtn {
 QPushButton#primaryBtn:hover {
     background-color: #3b7cf0;
 }
+QPushButton#primaryBtn:disabled {
+    background-color: #202632;
+    border-color: #2c3445;
+    color: #5c6a82;
+    font-weight: normal;
+}
 QPushButton#dangerBtn {
-    background-color: #9e2a2b;
-    border-color: #b83b3d;
+    background-color: #b82e30;
+    border-color: #d64547;
     color: #ffffff;
+    font-weight: bold;
+}
+QPushButton#dangerBtn:hover {
+    background-color: #d1383a;
+}
+QPushButton#dangerBtn:disabled {
+    background-color: #20232a;
+    border-color: #2b303a;
+    color: #5d6573;
+    font-weight: normal;
 }
 QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #13151a;

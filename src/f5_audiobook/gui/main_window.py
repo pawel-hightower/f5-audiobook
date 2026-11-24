@@ -116,13 +116,14 @@ class MainWindow(QMainWindow):
         self._chunk_rows_cache: list[ChunkRow] = []
         self._chunk_id_to_row: dict[int, int] = {}
         self._last_chapter_id_seen: int | None = None
-        self._chunks_sort_col: int = 1
+        self._chunks_sort_col: int = 2
         self._chunks_sort_order: Qt.SortOrder = Qt.AscendingOrder
 
         # Licznik czasu od startu generowania
         self._elapsed_base_sec: float = 0.0
         self._run_segment_start: float | None = None
         self._last_progress: BatchProgress | None = None
+        self._batch_state: str = "idle"  # idle | running | paused | stopping | stopped | done | error
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(1000)
         self._elapsed_timer.timeout.connect(self._on_elapsed_tick)
@@ -698,7 +699,12 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_start)
         btn_row.addWidget(self.btn_pause)
         btn_row.addWidget(self.btn_stop)
-        btn_row.addSpacing(16)
+        btn_row.addSpacing(10)
+        self.lbl_batch_badge = QLabel("⚪ Gotowy")
+        self.lbl_batch_badge.setAlignment(Qt.AlignCenter)
+        self.lbl_batch_badge.setMinimumWidth(135)
+        btn_row.addWidget(self.lbl_batch_badge)
+        btn_row.addSpacing(8)
         self.lbl_progress = QLabel("Postęp: 0 / 0 | Upłynęło: 0s | ETA: — | VRAM: —")
         btn_row.addWidget(self.lbl_progress, 1)
         ctrl_lay.addLayout(btn_row)
@@ -719,6 +725,7 @@ class MainWindow(QMainWindow):
             "Tylko oczekujące",
             "Podejrzane (ocena QG < 0.85)",
             "Tylko błędy",
+            "Wszystkie gotowe (cała książka)",
         ])
         self.combo_chunk_filter.currentIndexChanged.connect(self._refresh_chunks_table)
         filter_row.addWidget(self.combo_chunk_filter)
@@ -741,25 +748,27 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(self.btn_regen_chunk)
         layout.addLayout(filter_row)
 
-        self.tbl_chunks = QTableWidget(0, 7)
+        self.tbl_chunks = QTableWidget(0, 8)
         self.tbl_chunks.setHorizontalHeaderLabels(
-            ["Rozdział", "#", "Status", "Czas", "QG", "Tekst (do przeczytania — dwuklik edytuje)", "Usłyszano (Whisper)"]
+            ["▶", "Rozdział", "#", "Status", "Czas", "QG", "Tekst (do przeczytania — 2x klik edytuje)", "Usłyszano (Whisper)"]
         )
         # Wszystkie kolumny Interactive — można dowolnie zwężać Tekst i rozszerzać Whisper, a klik w nagłówek sortuje!
         hdr = self.tbl_chunks.horizontalHeader()
-        for col_i in range(7):
+        hdr.setSectionResizeMode(0, QHeaderView.Fixed)
+        for col_i in range(1, 8):
             hdr.setSectionResizeMode(col_i, QHeaderView.Interactive)
         hdr.setStretchLastSection(True)
         hdr.setSortIndicatorShown(True)
         hdr.setSortIndicator(self._chunks_sort_col, self._chunks_sort_order)
         hdr.sectionClicked.connect(self._on_chunks_header_clicked)
-        self.tbl_chunks.setColumnWidth(0, 95)
-        self.tbl_chunks.setColumnWidth(1, 45)
-        self.tbl_chunks.setColumnWidth(2, 68)
-        self.tbl_chunks.setColumnWidth(3, 55)
-        self.tbl_chunks.setColumnWidth(4, 55)
-        self.tbl_chunks.setColumnWidth(5, 430)
-        self.tbl_chunks.setColumnWidth(6, 380)
+        self.tbl_chunks.setColumnWidth(0, 34)
+        self.tbl_chunks.setColumnWidth(1, 90)
+        self.tbl_chunks.setColumnWidth(2, 45)
+        self.tbl_chunks.setColumnWidth(3, 66)
+        self.tbl_chunks.setColumnWidth(4, 52)
+        self.tbl_chunks.setColumnWidth(5, 52)
+        self.tbl_chunks.setColumnWidth(6, 420)
+        self.tbl_chunks.setColumnWidth(7, 370)
         self.tbl_chunks.verticalHeader().setVisible(False)
         self.tbl_chunks.setAlternatingRowColors(True)
         self.tbl_chunks.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -767,6 +776,8 @@ class MainWindow(QMainWindow):
             QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
         )
         self.tbl_chunks.itemChanged.connect(self._on_chunk_item_changed)
+        self.tbl_chunks.cellClicked.connect(self._on_chunk_cell_clicked)
+        self.tbl_chunks.cellDoubleClicked.connect(self._on_chunk_cell_double_clicked)
         layout.addWidget(self.tbl_chunks, 2)
 
         # Panel eksportu
@@ -944,14 +955,18 @@ class MainWindow(QMainWindow):
         if chunk_id not in self._chunk_id_to_row:
             self.combo_chunk_filter.setCurrentIndex(0)
             self._refresh_chunks_table()
+        if chunk_id not in self._chunk_id_to_row:
+            self.combo_chunk_filter.setCurrentIndex(5)
+            self._refresh_chunks_table()
         row = self._chunk_id_to_row.get(chunk_id)
         if row is not None and 0 <= row < self.tbl_chunks.rowCount():
             self.tbl_chunks.selectRow(row)
-            item = self.tbl_chunks.item(row, 5)
+            item = self.tbl_chunks.item(row, 6)
             if item is not None:
                 self.tbl_chunks.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            self.tbl_chunks.setFocus()
             self.lbl_global_status.setText(
-                "Zaznaczono fragment z odtwarzacza — kliknij 2x tekst, aby poprawić, lub kliknij Regeneruj."
+                "Zaznaczono fragment z odtwarzacza — widać tekst i Whisper; kliknij 2x tekst, aby edytować, lub Regeneruj."
             )
 
     # =========================================================================
@@ -1316,6 +1331,8 @@ class MainWindow(QMainWindow):
 
         self._refresh_chapters_table()
         self._refresh_chunks_table()
+        if not (self.batch_worker and self.batch_worker.isRunning()):
+            self._batch_state = "idle"
         self._update_progress_widgets()
         self.player_widget.set_project(self.db)
 
@@ -1718,29 +1735,57 @@ class MainWindow(QMainWindow):
         elapsed_s = _format_eta(self._current_elapsed_sec())
         pct = int((done / total) * 100) if total > 0 else 0
         self.progress_bar.setValue(pct)
-        self.lbl_progress.setText(
-            f"Postęp: {done} / {total} ({pct}%) | Błędów: {err} | Upłynęło: {elapsed_s} | ETA: {eta_s} | VRAM: {vram_s}"
-        )
 
-        # Globalny pasek statusu na dole (widoczny na KAŻDEJ zakładce!)
-        is_running = self.batch_worker is not None and self.batch_worker.isRunning()
-        is_paused = is_running and self.batch_worker.pause_event.is_set()
-        if is_running:
-            prefix = "⏸ Pauza" if is_paused else "▶ Generowanie"
+        state = self._batch_state
+        if state in ("idle", "stopped") and total > 0 and done >= total:
+            state = "done"
+
+        # Wyraźny status i kolor paska postępu — od razu widać czy generowanie trwa, czy stoi
+        badge_styles = {
+            "running": ("🟢 GENEROWANIE", "#163b29", "#2ea043", "#7ee787", "#2d6cdf"),
+            "paused": ("🟡 PAUZA", "#3d3112", "#d29922", "#f2cc60", "#d29922"),
+            "stopping": ("🟠 ZATRZYMYWANIE...", "#422512", "#db6d28", "#ffa657", "#db6d28"),
+            "stopped": ("⏹ ZATRZYMANO", "#252932", "#484f58", "#adb5bd", "#4a5568"),
+            "done": ("✅ UKOŃCZONO", "#163b29", "#2ea043", "#7ee787", "#2ea043"),
+            "error": ("🔴 BŁĄD", "#451a1c", "#da3633", "#ff7b72", "#da3633"),
+            "idle": ("⚪ GOTOWY", "#21252e", "#3c4352", "#9aa3b2", "#4a5568"),
+        }
+        badge_text, bg, border, fg, bar_color = badge_styles.get(state, badge_styles["idle"])
+        self.lbl_batch_badge.setText(badge_text)
+        self.lbl_batch_badge.setStyleSheet(
+            f"background-color: {bg}; border: 1px solid {border}; color: {fg}; "
+            f"border-radius: 5px; padding: 4px 10px; font-weight: bold; font-size: 9pt;"
+        )
+        bar_css = (
+            f"QProgressBar {{ border: 1px solid #323846; border-radius: 5px; text-align: center; "
+            f"background-color: #13151a; }} "
+            f"QProgressBar::chunk {{ background-color: {bar_color}; border-radius: 4px; }}"
+        )
+        self.progress_bar.setStyleSheet(bar_css)
+        self.status_progress_bar.setStyleSheet(bar_css)
+
+        if state in ("running", "paused", "stopping"):
+            self.lbl_progress.setText(
+                f"Postęp: {done} / {total} ({pct}%) | Błędów: {err} | Upłynęło: {elapsed_s} | ETA: {eta_s} | VRAM: {vram_s}"
+            )
             self.lbl_global_status.setText(
-                f"{prefix}: {done} / {total} ({pct}%) | Upłynęło: {elapsed_s} | ETA: {eta_s}"
+                f"{badge_text}: {done} / {total} ({pct}%) | Upłynęło: {elapsed_s} | ETA: {eta_s}"
             )
             self.status_progress_bar.setRange(0, 100)
             self.status_progress_bar.setValue(pct)
             self.status_progress_bar.setVisible(True)
         elif self.db is not None and total > 0:
+            self.lbl_progress.setText(
+                f"Postęp: {done} / {total} ({pct}%) | Błędów: {err} | Czas ostatniej sesji: {elapsed_s}"
+            )
             self.lbl_global_status.setText(
-                f"Projekt: {self.db.project_dir.name} — {done} / {total} ({pct}%)"
+                f"{badge_text} ({self.db.project_dir.name}): {done} / {total} ({pct}%)"
             )
             self.status_progress_bar.setRange(0, 100)
             self.status_progress_bar.setValue(pct)
             self.status_progress_bar.setVisible(done > 0)
         else:
+            self.lbl_progress.setText("Postęp: 0 / 0 | Upłynęło: 0s | ETA: — | VRAM: —")
             self.lbl_global_status.setText("Gotowy")
             self.status_progress_bar.setVisible(False)
 
@@ -1750,14 +1795,26 @@ class MainWindow(QMainWindow):
 
         was_blocked = self.tbl_chunks.blockSignals(True)
         try:
-            it0 = QTableWidgetItem(c.chapter_title[:28])
-            it0.setFlags(ro_flags)
-            it0.setData(Qt.UserRole, c.id)
-            self.tbl_chunks.setItem(row_idx, 0, it0)
+            # Kolumna 0: lekki przycisk Play (kliknięcie od razu odtwarza gotowy fragment)
+            play_item = QTableWidgetItem("▶" if c.status == "done" else "·")
+            play_item.setFlags(ro_flags)
+            play_item.setTextAlignment(Qt.AlignCenter)
+            play_item.setData(Qt.UserRole, c.id)
+            if c.status == "done":
+                play_item.setForeground(QColor("#57d9a3"))
+                play_item.setToolTip(f"Kliknij, aby odtworzyć fragment #{c.chunk_index + 1}")
+            else:
+                play_item.setForeground(QColor("#434c5e"))
+                play_item.setToolTip("Fragment jeszcze nie wygenerowany")
+            self.tbl_chunks.setItem(row_idx, 0, play_item)
 
-            it1 = QTableWidgetItem(str(c.chunk_index + 1))
+            it1 = QTableWidgetItem(c.chapter_title[:28])
             it1.setFlags(ro_flags)
             self.tbl_chunks.setItem(row_idx, 1, it1)
+
+            it2 = QTableWidgetItem(str(c.chunk_index + 1))
+            it2.setFlags(ro_flags)
+            self.tbl_chunks.setItem(row_idx, 2, it2)
 
             st_item = QTableWidgetItem(c.status)
             st_item.setFlags(ro_flags)
@@ -1765,30 +1822,30 @@ class MainWindow(QMainWindow):
                 st_item.setForeground(QColor("#57d9a3"))
             elif c.status == "error":
                 st_item.setForeground(QColor("#ff6b6b"))
-            self.tbl_chunks.setItem(row_idx, 2, st_item)
+            self.tbl_chunks.setItem(row_idx, 3, st_item)
 
             dur_s = f"{c.duration_sec:.1f}s" if c.duration_sec > 0 else "—"
-            it3 = QTableWidgetItem(dur_s)
-            it3.setFlags(ro_flags)
-            self.tbl_chunks.setItem(row_idx, 3, it3)
+            it4 = QTableWidgetItem(dur_s)
+            it4.setFlags(ro_flags)
+            self.tbl_chunks.setItem(row_idx, 4, it4)
 
             qg_s = f"{c.qg_score:.2f}" if c.qg_score is not None else "—"
             qg_item = QTableWidgetItem(qg_s)
             qg_item.setFlags(ro_flags)
             if c.qg_score is not None and c.qg_score < 0.80:
                 qg_item.setForeground(QColor("#f5a623"))
-            self.tbl_chunks.setItem(row_idx, 4, qg_item)
+            self.tbl_chunks.setItem(row_idx, 5, qg_item)
 
             txt_item = QTableWidgetItem(c.normalized_text)
             txt_item.setFlags(ed_flags)  # tylko kolumna tekstu jest edytowalna dwuklikiem!
             txt_item.setToolTip(c.normalized_text)
-            self.tbl_chunks.setItem(row_idx, 5, txt_item)
+            self.tbl_chunks.setItem(row_idx, 6, txt_item)
 
             heard_str = c.heard_text or c.error_msg
             heard_item = QTableWidgetItem(heard_str)
             heard_item.setFlags(ro_flags)
             heard_item.setToolTip(heard_str)
-            self.tbl_chunks.setItem(row_idx, 6, heard_item)
+            self.tbl_chunks.setItem(row_idx, 7, heard_item)
         finally:
             self.tbl_chunks.blockSignals(was_blocked)
 
@@ -1796,15 +1853,13 @@ class MainWindow(QMainWindow):
         col = self._chunks_sort_col
         reverse = self._chunks_sort_order == Qt.DescendingOrder
 
-        if col == 0:
+        if col in (0, 1, 2):
             key = lambda c: (c.chapter_index, c.chunk_index)
-        elif col == 1:
-            key = lambda c: (c.chapter_index, c.chunk_index)
-        elif col == 2:
-            key = lambda c: (c.status, c.chapter_index, c.chunk_index)
         elif col == 3:
-            key = lambda c: (c.duration_sec, c.chapter_index, c.chunk_index)
+            key = lambda c: (c.status, c.chapter_index, c.chunk_index)
         elif col == 4:
+            key = lambda c: (c.duration_sec, c.chapter_index, c.chunk_index)
+        elif col == 5:
             # Przy sortowaniu po QG rosnąco: najniższe oceny (np. 0.45, 0.72) lądują na samej górze,
             # a puste (pending / None) na dole!
             if not reverse:
@@ -1816,7 +1871,7 @@ class MainWindow(QMainWindow):
                 rows,
                 key=lambda c: (1 if c.qg_score is None else 0, -(c.qg_score if c.qg_score is not None else -1.0), c.chapter_index, c.chunk_index),
             )
-        elif col == 5:
+        elif col == 6:
             key = lambda c: c.normalized_text.lower()
         else:
             key = lambda c: (c.heard_text or c.error_msg).lower()
@@ -1824,6 +1879,8 @@ class MainWindow(QMainWindow):
         return sorted(rows, key=key, reverse=reverse)
 
     def _on_chunks_header_clicked(self, col: int) -> None:
+        if col == 0:
+            return
         if self._chunks_sort_col == col:
             self._chunks_sort_order = (
                 Qt.DescendingOrder if self._chunks_sort_order == Qt.AscendingOrder else Qt.AscendingOrder
@@ -1837,7 +1894,7 @@ class MainWindow(QMainWindow):
         self._refresh_chunks_table()
 
     def _on_chunk_item_changed(self, item: QTableWidgetItem) -> None:
-        if self.db is None or item.column() != 5:
+        if self.db is None or item.column() != 6:
             return
         row_idx = item.row()
         if not (0 <= row_idx < len(self._chunk_rows_cache)):
@@ -1865,18 +1922,21 @@ class MainWindow(QMainWindow):
             self._chunk_id_to_row = {}
             return
 
-        all_chunks = self.db.list_chunks(only_selected=True)
         mode = self.combo_chunk_filter.currentIndex()
-        if mode == 1:
-            rows = [c for c in all_chunks if c.status == "done"]
-        elif mode == 2:
-            rows = [c for c in all_chunks if c.status == "pending"]
-        elif mode == 3:
-            rows = [c for c in all_chunks if c.status == "done" and c.qg_score is not None and c.qg_score < 0.85]
-        elif mode == 4:
-            rows = [c for c in all_chunks if c.status == "error"]
+        if mode == 5:
+            rows = [c for c in self.db.list_chunks(only_selected=False) if c.status == "done"]
         else:
-            rows = all_chunks
+            all_chunks = self.db.list_chunks(only_selected=True)
+            if mode == 1:
+                rows = [c for c in all_chunks if c.status == "done"]
+            elif mode == 2:
+                rows = [c for c in all_chunks if c.status == "pending"]
+            elif mode == 3:
+                rows = [c for c in all_chunks if c.status == "done" and c.qg_score is not None and c.qg_score < 0.85]
+            elif mode == 4:
+                rows = [c for c in all_chunks if c.status == "error"]
+            else:
+                rows = all_chunks
 
         rows = self._sort_chunks_list(rows)
         self._chunk_rows_cache = rows
@@ -1901,10 +1961,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Brak profilu lektora", "Sprawdź ustawienia lektora w zakładce 2.")
             return
 
+        self._batch_state = "running"
         self.btn_start.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("⏸ Pauza")
         self.btn_stop.setEnabled(True)
+        self.btn_stop.setText("⏹ Stop")
         self.btn_export.setEnabled(False)
 
         self._elapsed_base_sec = 0.0
@@ -1925,6 +1987,7 @@ class MainWindow(QMainWindow):
             return
         paused = not self.batch_worker.pause_event.is_set()
         self.batch_worker.set_paused(paused)
+        self._batch_state = "paused" if paused else "running"
         if paused:
             if self._run_segment_start is not None:
                 self._elapsed_base_sec += max(0.0, time.monotonic() - self._run_segment_start)
@@ -1932,11 +1995,17 @@ class MainWindow(QMainWindow):
         else:
             self._run_segment_start = time.monotonic()
         self.btn_pause.setText("▶ Wznów" if paused else "⏸ Pauza")
+        self._update_progress_widgets(self._last_progress)
         self._log("Wstrzymano (pauza) — dokończę bieżące zdanie." if paused else "Wznowiono generowanie.")
 
     def _on_stop_batch(self) -> None:
         if self.batch_worker:
+            self._batch_state = "stopping"
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("⏳ Zatrzymuję...")
+            self.btn_pause.setEnabled(False)
             self.batch_worker.request_stop()
+            self._update_progress_widgets(self._last_progress)
             self._log("Zatrzymuję po bieżącym zdaniu...")
 
     def _on_batch_progress(self, prog: BatchProgress) -> None:
@@ -1953,13 +2022,17 @@ class MainWindow(QMainWindow):
                 self._refresh_chapters_table()
 
     def _on_batch_finished(self, prog: BatchProgress) -> None:
+        was_stopping = self._batch_state == "stopping"
+        self._batch_state = "done" if (prog.total > 0 and prog.done >= prog.total) else ("stopped" if was_stopping else "idle")
         if self._run_segment_start is not None:
             self._elapsed_base_sec += max(0.0, time.monotonic() - self._run_segment_start)
             self._run_segment_start = None
         self._elapsed_timer.stop()
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸ Pauza")
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("⏹ Stop")
         self.btn_export.setEnabled(True)
         self._update_progress_widgets(prog)
         self._refresh_chapters_table()
@@ -1968,14 +2041,18 @@ class MainWindow(QMainWindow):
         self._log(prog.message)
 
     def _on_batch_failed(self, err: str) -> None:
+        self._batch_state = "error"
         if self._run_segment_start is not None:
             self._elapsed_base_sec += max(0.0, time.monotonic() - self._run_segment_start)
             self._run_segment_start = None
         self._elapsed_timer.stop()
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸ Pauza")
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("⏹ Stop")
         self.btn_export.setEnabled(True)
+        self._update_progress_widgets(self._last_progress)
         self._log(f"[BŁĄD KRYTYCZNY] {err}")
         QMessageBox.critical(self, "Błąd generowania", err)
 
@@ -1987,6 +2064,31 @@ class MainWindow(QMainWindow):
         if 0 <= idx < len(self._chunk_rows_cache):
             return self._chunk_rows_cache[idx]
         return None
+
+    def _play_chunk_at_row(self, row: int) -> None:
+        if self.db is None or not (0 <= row < len(self._chunk_rows_cache)):
+            return
+        c = self._chunk_rows_cache[row]
+        if c.status != "done":
+            return
+        p = self.db.resolve_chunk_audio_path(c)
+        if p is None or not p.exists():
+            return
+        self.player_widget.pause_playback()
+        _play_wav_async(p)
+        self.lbl_global_status.setText(
+            f"🔊 Odsłuch: [{c.chapter_title}] #{c.chunk_index + 1} ({c.duration_sec:.1f}s)"
+        )
+
+    def _on_chunk_cell_clicked(self, row: int, col: int) -> None:
+        if col == 0:
+            self._play_chunk_at_row(row)
+
+    def _on_chunk_cell_double_clicked(self, row: int, col: int) -> None:
+        # Kolumna 6 (Tekst) służy do edycji dwuklikiem; każda inna kolumna (poza 0, która reaguje na 1 klik) odtwarza
+        if col in (0, 6):
+            return
+        self._play_chunk_at_row(row)
 
     def _on_play_selected_chunk(self) -> None:
         c = self._selected_chunk_row()
