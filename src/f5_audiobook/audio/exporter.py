@@ -137,8 +137,8 @@ def export_audiobook(
 
         parts: list[np.ndarray] = []
         for c_i, c in enumerate(chunks):
-            p = Path(c.audio_path)
-            if not p.exists():
+            p = db.resolve_chunk_audio_path(c)
+            if p is None or not p.exists():
                 continue
             wav_np, file_sr = sf.read(str(p), dtype="float32")
             sr = file_sr
@@ -188,6 +188,8 @@ def export_audiobook(
                 "-metadata",
                 f"artist={book_author}",
                 "-metadata",
+                f"album_artist={book_author}",
+                "-metadata",
                 f"track={idx}/{len(chapters)}",
                 str(mp3_path),
             ]
@@ -219,6 +221,7 @@ def export_audiobook(
             f"title={_escape_ffmetadata(book_title)}",
             f"album={_escape_ffmetadata(book_title)}",
             f"artist={_escape_ffmetadata(book_author)}",
+            f"album_artist={_escape_ffmetadata(book_author)}",
             "genre=Audiobook",
             "",
         ]

@@ -100,6 +100,11 @@ def chunk_paragraphs(
 
         is_heading = include_title and p_idx == 0 and len(norm_para) <= 90
 
+        # Jeśli nagłówek rozdziału to sama goła liczba ("1", "2", "IV"), rozwijamy go do "Rozdział pierwszy/drugi/czwarty.",
+        # dzięki czemu brzmi naturalnie jak prawdziwy audiobook i nie jest za krótki dla F5-TTS!
+        if is_heading and re.fullmatch(r"(?:\d{1,3}|[IVXL]{1,6})\.?", raw_para, re.IGNORECASE):
+            norm_para = normalize_polish_text(f"Rozdział {raw_para.rstrip('.')}.", pronunciation_dict)
+
         # Tytuł rozdziału zawsze w osobnym chunku z dłuższą pauzą
         if is_heading:
             if not re.search(r"[.!?]$", norm_para):

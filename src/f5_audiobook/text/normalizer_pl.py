@@ -174,6 +174,19 @@ _ROMAN_ORDINAL_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Polskie liczebniki porządkowe żeńskie (1..20) dla "Część 1" / "Księga 2" / "Scena 3"
+_ORD_FEM_1_20: dict[int, str] = {
+    1: "pierwsza", 2: "druga", 3: "trzecia", 4: "czwarta", 5: "piąta",
+    6: "szósta", 7: "siódma", 8: "ósma", 9: "dziewiąta", 10: "dziesiąta",
+    11: "jedenasta", 12: "dwunasta", 13: "trzynasta", 14: "czternasta", 15: "piętnasta",
+    16: "szesnasta", 17: "siedemnasta", 18: "osiemnasta", 19: "dziewiętnasta", 20: "dwudziesta",
+}
+
+_ARABIC_ORDINAL_PREFIX_RE = re.compile(
+    r"\b(Rozdział|Część|Tom|Księga|Akt|Scena)\s+(\d{1,3})\b",
+    re.IGNORECASE,
+)
+
 # Dekady: "lat 70.", "w latach 80.", "lat 90-tych", "lat 70. XX wieku"
 _DECADE_RE = re.compile(
     r"\b(lat|latach)\s+(20|30|40|50|60|70|80|90)(?:[-–]?tych|\.(?=\s+(?:[IVXL]{1,5}\b|[a-ząćęłńóśźż])|\s*[,;:]|\s*$))",
@@ -319,15 +332,24 @@ def normalize_polish_text(
 
     text = _DECADE_RE.sub(_repl_decade, text)
 
-    # 5. Liczby rzymskie w nagłówkach ("Rozdział IV" -> "Rozdział czwarty")
+    # 5. Liczby rzymskie i arabskie w nagłówkach ("Rozdział IV" -> "Rozdział czwarty", "Część 1" -> "Część pierwsza")
+    def _format_heading_ordinal(word: str, val: int) -> str:
+        if word.lower() in ("część", "księga", "scena") and val in _ORD_FEM_1_20:
+            return f"{word} {_ORD_FEM_1_20[val]}"
+        return f"{word} {_safe_num2words(val, to='ordinal')}"
+
     def _repl_roman_prefix(m: re.Match) -> str:
         word, roman = m.group(1), m.group(2).upper()
         val = _ROMAN_MAP.get(roman)
         if val is None:
             return m.group(0)
-        return f"{word} {_safe_num2words(val, to='ordinal')}"
+        return _format_heading_ordinal(word, val)
 
     text = _ROMAN_ORDINAL_PREFIX_RE.sub(_repl_roman_prefix, text)
+    text = _ARABIC_ORDINAL_PREFIX_RE.sub(
+        lambda m: _format_heading_ordinal(m.group(1), int(m.group(2))),
+        text,
+    )
 
     # 6. Wieki rzymskie: "w XX wieku" -> "w dwudziestym wieku", "XX wieku" -> "dwudziestego wieku"
     def _repl_century(m: re.Match) -> str:

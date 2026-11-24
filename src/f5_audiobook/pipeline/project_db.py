@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -363,6 +364,107 @@ class ProjectDB:
 
     def chunk_audio_path(self, chunk: ChunkRow) -> Path:
         return self.chunks_dir / f"ch{chunk.chapter_index:03d}_c{chunk.chunk_index:05d}.wav"
+
+    def resolve_chunk_audio_path(self, chunk: ChunkRow) -> Path | None:
+        """Zwraca istniejącą ścieżkę pliku WAV chunka (odporna na przeniesienie folderu projektu)."""
+        if chunk.audio_path:
+            p = Path(chunk.audio_path)
+            if p.exists():
+                return p
+            relocated = self.chunks_dir / p.name
+            if relocated.exists():
+                return relocated
+        fallback = self.chunk_audio_path(chunk)
+        return fallback if fallback.exists() else None
+
+    def update_book_metadata(self, title: str, author: str) -> None:
+        """Aktualizuje tytuł i autora książki w metadanych projektu."""
+        clean_title = title.strip()
+        clean_author = author.strip()
+        if not clean_title:
+            raise ValueError("Tytuł książki nie może być pusty.")
+        self.set_meta("title", clean_title)
+        self.set_meta("author", clean_author or "Nieznany autor")
+
+    def set_cover_image(self, src_image: Path) -> Path:
+        """Kopiuje nowy obraz okładki do folderu projektu i zapisuje ścieżkę w metadanych."""
+        src = Path(src_image)
+        if not src.exists() or not src.is_file():
+            raise FileNotFoundError(f"Nie znaleziono pliku okładki: {src}")
+        ext = src.suffix.lower().lstrip(".") or "jpg"
+        if ext == "jpeg":
+            ext = "jpg"
+        dest = self.project_dir / f"cover.{ext}"
+        # Usuń stare pliki cover.* z innym rozszerzeniem, żeby nie śmiecić
+        for old_cover in self.project_dir.glob("cover.*"):
+            if old_cover.resolve() != dest.resolve():
+                old_cover.unlink(missing_ok=True)
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        self.set_meta("cover_path", str(dest))
+        return dest
+
+    def rename_project(self, new_name: str) -> Path:
+        """Bezpiecznie zmienia nazwę folderu projektu w work/ i aktualizuje wszystkie ścieżki w SQLite."""
+        new_slug = slugify_project_name(new_name)
+        if not new_slug:
+            raise ValueError("Nazwa projektu nie może być pusta.")
+
+        old_dir = self.project_dir.resolve()
+        new_dir = old_dir.parent / new_slug
+        if new_dir.name == old_dir.name:
+            return self.project_dir
+
+        case_only_rename = new_dir.name.lower() == old_dir.name.lower()
+        if not case_only_rename and new_dir.exists():
+            raise FileExistsError(f"Projekt o nazwie „{new_slug}” już istnieje:\n{new_dir}")
+
+        # Zrób pełny checkpoint WAL i zamknij pliki -wal/-shm przed zmianą nazwy folderu (ważne na Windows)
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.execute("PRAGMA journal_mode=DELETE;")
+            conn.commit()
+        finally:
+            conn.close()
+
+        if case_only_rename:
+            tmp_dir = old_dir.parent / f"{old_dir.name}__renaming_tmp"
+            old_dir.rename(tmp_dir)
+            tmp_dir.rename(new_dir)
+        else:
+            old_dir.rename(new_dir)
+
+        self.project_dir = new_dir
+        self.chunks_dir = new_dir / "chunks"
+        self.db_path = new_dir / "project.db"
+
+        # Zaktualizuj ścieżki wewnątrz project.db (cover_path i wszystkie chunks.audio_path)
+        old_prefix = str(old_dir).rstrip("\\/").lower()
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key='cover_path'").fetchone()
+            if row and row["value"]:
+                old_cover = Path(row["value"])
+                new_cover = new_dir / old_cover.name
+                if new_cover.exists() or str(old_cover).lower().startswith(old_prefix):
+                    conn.execute(
+                        "UPDATE meta SET value=? WHERE key='cover_path'",
+                        (str(new_cover),),
+                    )
+
+            chunk_rows = conn.execute(
+                "SELECT id, audio_path FROM chunks WHERE audio_path IS NOT NULL AND audio_path != ''"
+            ).fetchall()
+            for r in chunk_rows:
+                old_ap = Path(r["audio_path"])
+                new_ap = self.chunks_dir / old_ap.name
+                if new_ap.exists() or str(old_ap).lower().startswith(old_prefix):
+                    conn.execute(
+                        "UPDATE chunks SET audio_path=? WHERE id=?",
+                        (str(new_ap), r["id"]),
+                    )
+
+        return self.project_dir
 
 
 def list_saved_projects(work_root: Path = WORK_DIR) -> list[Path]:

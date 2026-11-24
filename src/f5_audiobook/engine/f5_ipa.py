@@ -276,9 +276,9 @@ class F5IpaEngine:
         gen_ipa_len = max(1, len(ipa_gen))
 
         # Bardzo krótkie frazy dostają lekki zapas czasu, żeby nie ucinało końcówek
-        local_speed = speed * 0.85 if len(text.strip()) < 22 else speed
+        local_speed = speed * 0.78 if len(text.strip()) < 22 else speed
         duration = max(
-            ref_audio_len + 45,
+            ref_audio_len + 65,
             ref_audio_len + int((ref_audio_len / ref_ipa_len) * gen_ipa_len / max(0.5, local_speed)),
         )
 

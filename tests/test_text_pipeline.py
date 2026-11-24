@@ -57,9 +57,18 @@ def test_chunker_merges_short_and_splits_long() -> None:
     ]
     chunks = chunk_paragraphs(paras, DEFAULT_PRONUNCIATION, max_chars=110, chapter_title="Rozdział 1")
     assert chunks[0].pause_after_ms == PAUSE_HEADING_MS
+    assert "rozdział pierwszy." in chunks[0].normalized_text.lower(), chunks[0].normalized_text
     assert chunks[-1].pause_after_ms == PAUSE_PARAGRAPH_MS
     for c in chunks[1:]:
         assert len(c.normalized_text) <= 130, f"Za długi chunk: {c.normalized_text}"
+
+    # Goły numer rozdziału ("3") powinien rozwinąć się do "Rozdział trzeci."
+    c_num = chunk_paragraphs(["Pierwsze zdanie."], DEFAULT_PRONUNCIATION, chapter_title="3")
+    assert c_num[0].normalized_text == "Rozdział trzeci.", c_num[0].normalized_text
+
+    # "Część 2 – Właściwa miara" -> "Część druga, Właściwa miara."
+    c_part = chunk_paragraphs(["Część 2 – Właściwa miara"], DEFAULT_PRONUNCIATION, chapter_title="Część 2 – Właściwa miara")
+    assert c_part[0].normalized_text == "Część druga, Właściwa miara.", c_part[0].normalized_text
 
 
 def test_project_db_roundtrip(tmp_path: Path) -> None:
