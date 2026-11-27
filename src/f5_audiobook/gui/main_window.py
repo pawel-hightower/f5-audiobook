@@ -59,6 +59,7 @@ from f5_audiobook.engine.f5_ipa import F5IpaEngine
 from f5_audiobook.gui.player_widget import AudiobookPlayerWidget
 from f5_audiobook.gui.voice_panel import VoiceRolePanel
 from f5_audiobook.gui.workers import (
+    AiPreloadWorker,
     BatchWorker,
     BielikTaggerWorker,
     ExportWorker,
@@ -171,6 +172,9 @@ class MainWindow(QMainWindow):
         self.regen_worker: RegenerateChunkWorker | None = None
         self.export_worker: ExportWorker | None = None
         self.bielik_worker: BielikTaggerWorker | None = None
+        self.preload_worker: AiPreloadWorker | None = None
+        self._ai_libs_ready: bool = False
+        self._ai_device_info: str = ""
         self._active_test_role: str = "narrator"
         self._chunk_rows_cache: list[ChunkRow] = []
         self._tbl_row_meta: list[tuple[str, object]] = []  # ("group", group_id) | ("chunk", ChunkRow)
@@ -213,6 +217,51 @@ class MainWindow(QMainWindow):
         self._refresh_saved_projects()
         self._refresh_voices()
         self._load_pronunciation_table()
+        self._set_ai_generation_buttons_enabled(False)
+        self.lbl_global_status.setText(
+            "⏳ Wczytuję biblioteki AI (PyTorch / CUDA) w tle — możesz już otwierać projekty i słuchać..."
+        )
+        self.status_progress_bar.setRange(0, 0)
+        self.status_progress_bar.setVisible(True)
+        QTimer.singleShot(80, self._start_ai_preload)
+
+    def _set_ai_generation_buttons_enabled(self, ready: bool) -> None:
+        self.btn_start.setEnabled(ready)
+        self.btn_regen_chunk.setEnabled(ready)
+        tip_wait = "Trwa wczytywanie bibliotek AI (PyTorch / CUDA) w tle — za kilka sekund będzie gotowe."
+        self.btn_start.setToolTip("" if ready else tip_wait)
+        for panel in self._voice_panels.values():
+            panel.btn_run_test.setEnabled(ready)
+            panel.btn_run_test.setToolTip("" if ready else tip_wait)
+
+    def _start_ai_preload(self) -> None:
+        if self._ai_libs_ready or (self.preload_worker and self.preload_worker.isRunning()):
+            return
+        self.preload_worker = AiPreloadWorker()
+        self.preload_worker.finished_ok.connect(self._on_ai_preload_done)
+        self.preload_worker.failed.connect(self._on_ai_preload_failed)
+        self.preload_worker.start()
+
+    def _on_ai_preload_done(self, dev_info: str) -> None:
+        self._ai_libs_ready = True
+        self._ai_device_info = dev_info
+        busy = any(
+            w is not None and w.isRunning()
+            for w in (self.batch_worker, self.bielik_worker, self.regen_worker, self.test_worker)
+        )
+        if not busy:
+            self._set_ai_generation_buttons_enabled(True)
+        self.status_progress_bar.setRange(0, 100)
+        self._update_progress_widgets(self._last_progress)
+        self.lbl_global_status.setText(f"✅ Biblioteki AI gotowe ({dev_info})")
+        self._log(f"Wczytano biblioteki AI w tle ({dev_info}).")
+
+    def _on_ai_preload_failed(self, err: str) -> None:
+        self._ai_libs_ready = False
+        self.status_progress_bar.setRange(0, 100)
+        self.status_progress_bar.setVisible(False)
+        self.lbl_global_status.setText(f"⚠️ Błąd ładowania bibliotek AI: {err}")
+        self._log(f"[BŁĄD ŁADOWANIA AI] {err}")
 
     def _build_global_status_bar(self) -> None:
         sb = self.statusBar()
@@ -1902,7 +1951,14 @@ class MainWindow(QMainWindow):
         self.progress_bar.setStyleSheet(bar_css)
         self.status_progress_bar.setStyleSheet(bar_css)
 
-        if state in ("running", "paused", "stopping"):
+        if not self._ai_libs_ready:
+            # Nie zasłaniaj paska ładowania bibliotek AI w tle statycznym stanem projektu
+            self.lbl_global_status.setText(
+                "⏳ Wczytuję biblioteki AI (PyTorch / CUDA) w tle — możesz już otwierać projekty i słuchać..."
+            )
+            self.status_progress_bar.setRange(0, 0)
+            self.status_progress_bar.setVisible(True)
+        elif state in ("running", "paused", "stopping"):
             self.lbl_progress.setText(
                 f"Postęp: {done} / {total} ({pct}%) | Błędów: {err} | Upłynęło: {elapsed_s} | ETA: {eta_s} | VRAM: {vram_s}"
             )
@@ -2252,6 +2308,9 @@ class MainWindow(QMainWindow):
             self.btn_toggle_chunks_collapse.setText("⊟ Zwiń części")
 
     def _on_start_batch(self) -> None:
+        if not self._ai_libs_ready:
+            QMessageBox.information(self, "Trwa uruchamianie AI", "Poczekaj kilka sekund na dokończenie wczytywania bibliotek AI.")
+            return
         if self.db is None:
             QMessageBox.warning(self, "Brak projektu", "Najpierw wczytaj książkę w zakładce 1.")
             return
@@ -2513,6 +2572,9 @@ class MainWindow(QMainWindow):
         _play_wav_async(p)
 
     def _on_regenerate_selected_chunk(self) -> None:
+        if not self._ai_libs_ready:
+            QMessageBox.information(self, "Trwa uruchamianie AI", "Poczekaj kilka sekund na dokończenie wczytywania bibliotek AI.")
+            return
         if self.batch_worker and self.batch_worker.isRunning():
             QMessageBox.warning(self, "Zajęte", "Najpierw zatrzymaj generowanie wsadowe.")
             return
@@ -2694,5 +2756,7 @@ class MainWindow(QMainWindow):
         if self.bielik_worker and self.bielik_worker.isRunning():
             self.bielik_worker.request_stop()
             self.bielik_worker.wait(5000)
+        if self.preload_worker and self.preload_worker.isRunning():
+            self.preload_worker.wait(3000)
         self.engine.unload()
         super().closeEvent(event)

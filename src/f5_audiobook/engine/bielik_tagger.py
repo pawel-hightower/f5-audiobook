@@ -24,12 +24,13 @@ from typing import Callable
 from f5_audiobook.config import BIELIK_MODEL_DIR, LLAMA_CPP_DIR
 from f5_audiobook.pipeline.project_db import ChunkRow
 
-# Szybka polska heurystyka gramatyczna (fallback oraz podpowiedź przy imporcie przed Bielikiem)
+# Szybka polska heurystyka gramatyczna + twarde kotwice z didaskaliów
 _MALE_TAG_RE = re.compile(
     r"\b(?:powiedział|odparł|zapytał|spytał|dodał|rzucił|mruknął|szepnął|krzyknął|wykrzyknął|"
     r"odrzekł|zawołał|westchnął|uśmiechnął|pokiwał|skinął|wyjaśnił|stwierdził|przerwał|"
     r"kontynuował|ciągnął|zauważył|przyznał|zapewnił|ostrzegł|poradził|bąknął|warknął|"
-    r"prychnął|syknął|parsknął|zaśmiał|wyszeptał|rzekł|przytaknął)\b",
+    r"prychnął|syknął|parsknął|zaśmiał|wyszeptał|rzekł|przytaknął|poprosił|wymamrotał|"
+    r"wypalił|jęknął|stęknął|wysapał|wycedził|skwitował|burknął|fuknął|parsknął|dopytywał)\b",
     re.IGNORECASE,
 )
 _FEMALE_TAG_RE = re.compile(
@@ -37,15 +38,75 @@ _FEMALE_TAG_RE = re.compile(
     r"wykrzyknęła|odrzekła|zawołała|westchnęła|uśmiechnęła|pokiwała|skinęła|wyjaśniła|"
     r"stwierdziła|przerwała|kontynuowała|ciągnęła|zauważyła|przyznała|zapewniła|ostrzegła|"
     r"poradziła|bąknęła|warknęła|prychnęła|syknęła|parsknęła|zaśmiała|wyszeptała|rzekła|"
-    r"przytaknęła)\b",
+    r"przytaknęła|poprosiła|wymamrotała|wypaliła|jęknęła|stęknęła|wysapała|wycedziła|"
+    r"skwitowała|burknęła|fuknęła|dopytywała)\b",
     re.IGNORECASE,
 )
 _MALE_SELF_RE = re.compile(r"\b[a-ząćęłńóśźż]{2,}(?:ałem|iłem|yłem|ełem|ąłem|łem)\b", re.IGNORECASE)
 _FEMALE_SELF_RE = re.compile(r"\b[a-ząćęłńóśźż]{2,}(?:ałam|iłam|yłam|ełam|ęłam|łam)\b", re.IGNORECASE)
 
+# Ogólny detektor polskiej końcówki czasownika przeszłego w 3. os. l.p. na początku didaskaliów
+_WORD_PL_RE = re.compile(r"[a-ząćęłńóśźż]+", re.IGNORECASE)
+_FEM_PAST_VERB_RE = re.compile(
+    r"^[a-ząćęłńóśźż]{3,}(?:ała|iła|yła|eła|ęła|rła|sła|zła|dła|tła|kła|gła|bła|pła|wła|chła)$"
+)
+_MALE_PAST_VERB_RE = re.compile(
+    r"^[a-ząćęłńóśźż]{3,}(?:ał|ił|ył|eł|ął|rł|sł|zł|dł|tł|kł|gł|bł|pł|wł|chł)$"
+)
+# Rzeczowniki, przymiotniki oraz czasowniki bezosobowe/dźwiękowe, które nie określają płci mówcy
+_NON_SPEAKER_FEM = {
+    "siła", "chwała", "skała", "strzała", "bryła", "mgła", "igła", "mała", "cała", "biała",
+    "piła", "sala", "fala", "rozległa", "dobiegła", "padła", "brzmiała", "zabrzmiała",
+    "wydobyła", "zapadła", "minęła", "upłynęła", "trwała", "została", "była",
+}
+_NON_SPEAKER_MALE = {
+    "diabeł", "orzeł", "anioł", "poseł", "węzeł", "kocioł", "osioł", "stół", "dół", "wół", "pół",
+    "rozległ", "dobiegł", "padł", "brzmiał", "zabrzmiał", "wydobył", "zapadł", "minął",
+    "upłynął", "powstał", "nastał", "trwał", "został", "był", "miał", "głos",
+}
+_LEADING_ADVERBS = {
+    "cicho", "głośno", "nagle", "szybko", "powoli", "znowu", "znów", "wreszcie", "zaraz",
+    "potem", "wtedy", "ledwo", "ledwie", "prawie", "tylko", "ponownie", "natychmiast",
+    "gniewnie", "spokojnie", "delikatnie", "nerwowo", "chłodno", "sucho", "oschle",
+    "ciepło", "smutno", "wesoło", "ostro", "łagodnie", "niepewnie", "nieśmiało",
+    "lekko", "mocno", "ostrożnie", "cichutko", "półgłosem", "szeptem", "krótko",
+}
+
+
+def extract_didaskalia_gender(narrator_text: str) -> str | None:
+    """Deterministycznie określa płeć mówcy ('male' | 'female' | None) z początku polskich didaskaliów.
+
+    Działa dla DOWOLNEGO polskiego czasownika przeszłego w 3. os. l.p. (-ł vs -ła), np.:
+    'poprosiła Dżuliet.', 'wymamrotał mężczyzna.', 'cicho wyszeptała.', 'pstryknęła palcem...'.
+    """
+    txt = (narrator_text or "").lstrip(" —–-\t\n")
+    if not txt:
+        return None
+    words = _WORD_PL_RE.findall(txt)
+    if not words:
+        return None
+
+    # Sprawdzamy pierwsze słowo, a jeśli to przysłówek sposobu (np. "cicho wyszeptała") — także drugie
+    candidates = [words[0].lower()]
+    if len(words) >= 2 and candidates[0] in _LEADING_ADVERBS:
+        candidates.append(words[1].lower())
+
+    for w in candidates:
+        if w in _NON_SPEAKER_FEM or w in _NON_SPEAKER_MALE:
+            return None
+        if _FEM_PAST_VERB_RE.match(w):
+            return "female"
+        if _MALE_PAST_VERB_RE.match(w):
+            return "male"
+    return None
+
 
 def heuristic_guess_dialogue_gender(dialogue_text: str, next_narrator_text: str = "", prev_narrator_text: str = "") -> str | None:
-    """Szybka polska heurystyka gramatyczna ('male' | 'female' | None) po końcówkach czasowników."""
+    """Polska heurystyka gramatyczna ('male' | 'female' | None) po didaskaliach i końcówkach czasowników."""
+    if next_narrator_text:
+        direct = extract_didaskalia_gender(next_narrator_text)
+        if direct:
+            return direct
     for ctx in (next_narrator_text, prev_narrator_text):
         if not ctx:
             continue
@@ -63,6 +124,125 @@ def heuristic_guess_dialogue_gender(dialogue_text: str, next_narrator_text: str 
     if fs and not ms:
         return "female"
     return None
+
+
+def _is_dialogue_chunk(c: ChunkRow) -> bool:
+    if c.voice_role in ("dialogue", "male", "female"):
+        return True
+    raw = (c.raw_text or "").lstrip()
+    return raw.startswith(("—", "–", "- ", "„", '"'))
+
+
+def compute_hard_grammar_anchors(
+    chunks: list[ChunkRow],
+) -> tuple[dict[int, str], list[tuple[int, int]]]:
+    """Wyznacza 100%-pewne kotwice gramatyczne płci oraz powiązane połówki przerwanego akapitu dialogowego.
+
+    Zwraca:
+      - anchors: {chunk_id: 'male' | 'female'} — twarde przypisania z jawnych didaskaliów (Bielik nie może ich nadpisać!)
+      - linked_pairs: [(first_dialogue_id, continuation_dialogue_id), ...] — połówki tej samej wypowiedzi
+        rozdzielone didaskaliami (pauza 220 ms), które ZAWSZE muszą mieć tego samego mówcę.
+    """
+    anchors: dict[int, str] = {}
+    linked_pairs: list[tuple[int, int]] = []
+    n = len(chunks)
+
+    for i in range(n - 1):
+        cur = chunks[i]
+        nxt = chunks[i + 1]
+        if cur.chapter_id != nxt.chapter_id:
+            continue
+        if not _is_dialogue_chunk(cur) or _is_dialogue_chunk(nxt):
+            continue
+
+        ntxt = (nxt.normalized_text or nxt.raw_text or "").strip()
+        if not ntxt:
+            continue
+        # Tylko didaskalia z tego samego akapitu (pauza 220 ms lub rozpoczęte małą literą)
+        is_same_para_didaskalia = (cur.pause_after_ms == 220) or ntxt[0].islower()
+        if not is_same_para_didaskalia:
+            continue
+
+        # Jeśli po didaskaliach (220 ms) następuje dalszy ciąg dialogu w tym samym akapicie -> zwiąż je!
+        has_cont = (
+            nxt.pause_after_ms == 220
+            and (i + 2) < n
+            and chunks[i + 2].chapter_id == cur.chapter_id
+            and _is_dialogue_chunk(chunks[i + 2])
+        )
+        if has_cont:
+            linked_pairs.append((cur.id, chunks[i + 2].id))
+
+        gender = extract_didaskalia_gender(ntxt)
+        if gender in ("male", "female"):
+            anchors[cur.id] = gender
+            if has_cont:
+                anchors[chunks[i + 2].id] = gender
+
+    # Propagacja kotwic przez łańcuchy 3-częściowych przerwanych akapitów (A - did - B - did - C)
+    changed = True
+    while changed:
+        changed = False
+        for a_id, b_id in linked_pairs:
+            if a_id in anchors and b_id not in anchors:
+                anchors[b_id] = anchors[a_id]
+                changed = True
+            elif b_id in anchors and a_id not in anchors:
+                anchors[a_id] = anchors[b_id]
+                changed = True
+
+    return anchors, linked_pairs
+
+
+def apply_grammar_anchors_to_project(db) -> dict[str, int]:
+    """Koryguje w bazie projektu wszystkie dialogi sprzeczne z polską gramatyką didaskaliów i spójnością akapitu.
+
+    Dla każdego zmienionego chunka (w tym już wygenerowanych 'done') ustawia poprawną rolę i status='pending'.
+    """
+    chapters = db.list_chapters()
+    fixed_total = 0
+    fixed_done_reset = 0
+    fixed_pending = 0
+    anchors_total = 0
+
+    for ch in chapters:
+        if not ch.multi_voice:
+            continue
+        chunks = db.list_chunks(chapter_id=ch.id)
+        if not chunks:
+            continue
+        anchors, linked_pairs = compute_hard_grammar_anchors(chunks)
+        anchors_total += len(anchors)
+
+        by_id = {c.id: c for c in chunks}
+        target_roles: dict[int, str] = dict(anchors)
+
+        # Dla powiązanych połówek bez twardej kotwicy (didaskalia bezpłciowe) wyrównaj drugą do pierwszej
+        for a_id, b_id in linked_pairs:
+            a_role = target_roles.get(a_id, by_id[a_id].voice_role)
+            if a_role in ("male", "female") and b_id not in target_roles:
+                if by_id[b_id].voice_role != a_role:
+                    target_roles[b_id] = a_role
+
+        updates: dict[int, str] = {}
+        for cid, new_role in target_roles.items():
+            cur_c = by_id[cid]
+            if cur_c.voice_role != new_role:
+                updates[cid] = new_role
+                if cur_c.status == "done":
+                    fixed_done_reset += 1
+                else:
+                    fixed_pending += 1
+
+        if updates:
+            fixed_total += db.set_chunks_voice_roles_bulk(updates, reset_changed_to_pending=True)
+
+    return {
+        "anchors_total": anchors_total,
+        "fixed_total": fixed_total,
+        "fixed_done_reset": fixed_done_reset,
+        "fixed_pending": fixed_pending,
+    }
 
 
 def find_bielik_gguf(model_dir: Path = BIELIK_MODEL_DIR) -> Path | None:
@@ -252,21 +432,17 @@ class BielikTagger:
         window_size: int = 28,
         context_overlap: int = 6,
     ) -> dict[int, str]:
-        """Taguje wszystkie dialogowe chunki rozdziału (voice_role != 'narrator' lub z '—').
+        """Taguje wszystkie dialogowe chunki rozdziału łącząc 100%-pewne kotwice gramatyczne PL z Bielikiem AI.
 
         Zwraca słownik {chunk_id: 'narrator' | 'male' | 'female'}.
         """
-        # Wybieramy chunki oznaczone jako dialog (lub już wcześniej przydzielone do male/female)
-        def _is_dialogue_candidate(c: ChunkRow) -> bool:
-            if c.voice_role in ("dialogue", "male", "female"):
-                return True
-            raw = (c.raw_text or "").lstrip()
-            return raw.startswith(("—", "–", "- ", "„", '"'))
-
-        if not any(_is_dialogue_candidate(c) for c in chunks):
+        if not any(_is_dialogue_chunk(c) for c in chunks):
             return {}
 
-        assignments: dict[int, str] = {}
+        # 1) Najpierw twarde kotwice z polskiej gramatyki didaskaliów (Bielik NIE MOŻE ich nadpisać!)
+        anchors, linked_pairs = compute_hard_grammar_anchors(chunks)
+        assignments: dict[int, str] = dict(anchors)
+
         n = len(chunks)
         start = 0
         last_known_role = "male"
@@ -275,9 +451,14 @@ class BielikTagger:
             end = min(n, start + window_size)
             ctx_start = max(0, start - context_overlap)
 
-            # Zbierz dialogi w oknie [start, end)
-            window_dialogues: list[ChunkRow] = [c for c in chunks[start:end] if _is_dialogue_candidate(c)]
-            if not window_dialogues:
+            # Zbierz tylko te dialogi w oknie [start, end), które NIE mają jeszcze twardej kotwicy
+            open_dialogues: list[ChunkRow] = [
+                c for c in chunks[start:end] if _is_dialogue_chunk(c) and c.id not in anchors
+            ]
+            if not open_dialogues:
+                for c in chunks[start:end]:
+                    if c.id in anchors:
+                        last_known_role = anchors[c.id]
                 start = end
                 continue
 
@@ -290,10 +471,13 @@ class BielikTagger:
                     lines.append(f"  ({short_r}) {c.raw_text or c.normalized_text}")
                 lines.append("")
 
-            lines.append("BIEŻĄCY FRAGMENT (określ M / K / N dla każdego [D<id>]):")
+            lines.append("BIEŻĄCY FRAGMENT (określ M / K / N WYŁĄCZNIE dla linii [D<id>]; linie [PEWNE: M/K] są już ustalone):")
             for c in chunks[start:end]:
                 txt = (c.raw_text or c.normalized_text).strip()
-                if _is_dialogue_candidate(c):
+                if c.id in anchors:
+                    sr = "M" if anchors[c.id] == "male" else "K"
+                    lines.append(f"[PEWNE: {sr}] {txt}")
+                elif _is_dialogue_chunk(c):
                     lines.append(f"[D{c.id}] {txt}")
                 else:
                     lines.append(f"[N] {txt}")
@@ -301,9 +485,8 @@ class BielikTagger:
             prompt = "\n".join(lines)
             parsed_roles: dict[str, str] = {}
             try:
-                res = self._chat_json(prompt, max_tokens=max(768, len(window_dialogues) * 64))
+                res = self._chat_json(prompt, max_tokens=max(768, len(open_dialogues) * 64))
                 if isinstance(res, dict):
-                    # Obsługa formatu listowego {"wynik": [{"id": 2, "mowi": "...", "g": "M"}, ...]}
                     list_val = None
                     for v in res.values():
                         if isinstance(v, list):
@@ -319,7 +502,6 @@ class BielikTagger:
                                     if cid_clean:
                                         parsed_roles[cid_clean] = str(g_raw).strip().upper()
                     else:
-                        # Fallback dla płaskiego słownika lub słownika zagnieżdżonego pod dowolnym kluczem
                         dict_val = res
                         if len(res) == 1 and isinstance(next(iter(res.values())), dict):
                             dict_val = next(iter(res.values()))
@@ -332,7 +514,11 @@ class BielikTagger:
 
             for idx_in_ch in range(start, end):
                 c = chunks[idx_in_ch]
-                if not _is_dialogue_candidate(c):
+                if c.id in anchors:
+                    assignments[c.id] = anchors[c.id]
+                    last_known_role = anchors[c.id]
+                    continue
+                if not _is_dialogue_chunk(c):
                     continue
                 code = parsed_roles.get(str(c.id), "")
                 if code.startswith("M"):
@@ -342,7 +528,6 @@ class BielikTagger:
                 elif code.startswith("N"):
                     role = "narrator"
                 else:
-                    # Fallback do polskiej heurystyki gramatycznej z sąsiednich chunków
                     prev_txt = chunks[idx_in_ch - 1].raw_text if idx_in_ch > 0 else ""
                     next_txt = chunks[idx_in_ch + 1].raw_text if idx_in_ch + 1 < n else ""
                     role = heuristic_guess_dialogue_gender(c.raw_text or c.normalized_text, next_txt, prev_txt) or last_known_role
@@ -351,5 +536,14 @@ class BielikTagger:
                     last_known_role = role
 
             start = end
+
+        # 2) Gwarancja spójności przerwanego akapitu (obie połówki przed i po didaskaliach 220 ms mają tego samego mówcę)
+        for a_id, b_id in linked_pairs:
+            if a_id in anchors:
+                assignments[b_id] = anchors[a_id]
+            elif b_id in anchors:
+                assignments[a_id] = anchors[b_id]
+            elif a_id in assignments and assignments[a_id] in ("male", "female"):
+                assignments[b_id] = assignments[a_id]
 
         return assignments

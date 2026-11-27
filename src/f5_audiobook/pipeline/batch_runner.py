@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Callable
 
 import soundfile as sf
-import torch
 
 from f5_audiobook.engine.f5_ipa import F5IpaEngine, SynthesisResult
 from f5_audiobook.engine.quality_guard import QualityGuard, QualityReport
@@ -275,6 +274,8 @@ class BatchRunner:
         db.set_meta("voice_name", voice.name)
         if log_cb:
             log_cb("Ładowanie silnika F5-TTS IPA (Gregniuki/multi3)...")
+        import torch
+
         self.engine.load()
 
         pending = db.get_pending_chunks()
@@ -537,6 +538,9 @@ class BatchRunner:
 
     @staticmethod
     def _current_vram_mb() -> float:
-        if torch.cuda.is_available():
-            return torch.cuda.memory_allocated() / (1024**2)
+        import sys
+
+        torch_mod = sys.modules.get("torch")
+        if torch_mod is not None and torch_mod.cuda.is_available():
+            return torch_mod.cuda.memory_allocated() / (1024**2)
         return 0.0

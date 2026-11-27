@@ -10,10 +10,24 @@ from PySide6.QtCore import QThread, Signal
 
 from f5_audiobook.audio.exporter import ExportResult, export_audiobook
 from f5_audiobook.config import OUTPUT_DIR
-from f5_audiobook.engine.f5_ipa import F5IpaEngine
+from f5_audiobook.engine.f5_ipa import F5IpaEngine, preload_ai_libraries
 from f5_audiobook.pipeline.batch_runner import BatchOptions, BatchProgress, BatchRunner
 from f5_audiobook.pipeline.project_db import ProjectDB
 from f5_audiobook.voices import VoiceProfile
+
+
+class AiPreloadWorker(QThread):
+    """Wczytuje w tle biblioteki AI (PyTorch / CUDA / F5-TTS), nie blokując błyskawicznego otwarcia okna."""
+
+    finished_ok = Signal(str)  # opis urządzenia np. "CUDA — NVIDIA GeForce RTX 4050"
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            dev_info = preload_ai_libraries()
+            self.finished_ok.emit(dev_info)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class BatchWorker(QThread):

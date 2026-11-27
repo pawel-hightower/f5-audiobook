@@ -272,6 +272,42 @@ def test_length_bucketed_batching() -> None:
     assert any(len(b) == 1 and b[0].id == 7 for _, b in buckets)
 
 
+def test_polish_didaskalia_hard_anchors() -> None:
+    from f5_audiobook.engine.bielik_tagger import (
+        compute_hard_grammar_anchors,
+        extract_didaskalia_gender,
+    )
+    from f5_audiobook.pipeline.project_db import ChunkRow
+
+    assert extract_didaskalia_gender("poprosiła Dżuliet.") == "female"
+    assert extract_didaskalia_gender("wymamrotał mężczyzna.") == "male"
+    assert extract_didaskalia_gender("wypaliła Dżuliet.") == "female"
+    assert extract_didaskalia_gender("cicho wyszeptała.") == "female"
+    assert extract_didaskalia_gender("nagle krzyknął.") == "male"
+    assert extract_didaskalia_gender("zapytała i jego uśmiech zniknął.") == "female"
+    assert extract_didaskalia_gender("rozległ się głos z głębi.") is None
+    assert extract_didaskalia_gender("było cicho.") is None
+
+    def _c(cid: int, role: str, txt: str, pause: int) -> ChunkRow:
+        return ChunkRow(
+            id=cid, chapter_id=1, chapter_index=0, chapter_title="46",
+            chunk_index=cid, raw_text=txt, normalized_text=txt, pause_after_ms=pause,
+            status="pending", audio_path=None, duration_sec=0.0, seed=101,
+            qg_score=None, qg_note="", heard_text="", error_msg="", voice_role=role,
+        )
+
+    rows = [
+        _c(1, "male", "Zostań.", 220),
+        _c(2, "narrator", "poprosiła Dżuliet.", 220),
+        _c(3, "male", "Nie zrobię ci krzywdy.", 700),
+        _c(4, "female", "Prze przepraszam.", 220),
+        _c(5, "narrator", "wymamrotał mężczyzna.", 1200),
+    ]
+    anchors, linked = compute_hard_grammar_anchors(rows)
+    assert anchors == {1: "female", 3: "female", 4: "male"}, anchors
+    assert linked == [(1, 3)], linked
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -280,6 +316,7 @@ if __name__ == "__main__":
     test_short_carrier_slicing_helpers()
     test_player_auto_rewind_logic()
     test_length_bucketed_batching()
+    test_polish_didaskalia_hard_anchors()
     with tempfile.TemporaryDirectory() as td:
         test_project_db_roundtrip(Path(td))
         test_parse_txt(Path(td))

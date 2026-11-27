@@ -12,6 +12,7 @@ if sys.platform == "win32":
     os.environ.setdefault("QT_MEDIA_BACKEND", "windows")
 
 from PySide6.QtGui import QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
 from f5_audiobook.config import (
@@ -23,6 +24,8 @@ from f5_audiobook.config import (
     ensure_dirs,
 )
 from f5_audiobook.gui.main_window import MainWindow
+
+_SINGLE_INSTANCE_KEY = "bAIarz_SingleInstance_v1"
 
 
 DARK_STYLESHEET = """
@@ -177,6 +180,40 @@ def _load_app_icon() -> QIcon:
     return QIcon()
 
 
+def _notify_existing_instance() -> bool:
+    """Jeśli bAIarz jest już uruchomiony, wysyła sygnał przywrócenia okna i zwraca True."""
+    sock = QLocalSocket()
+    sock.connectToServer(_SINGLE_INSTANCE_KEY)
+    if sock.waitForConnected(250):
+        sock.write(b"SHOW")
+        sock.flush()
+        sock.waitForBytesWritten(250)
+        sock.disconnectFromServer()
+        return True
+    return False
+
+
+def _start_single_instance_server(win: MainWindow) -> QLocalServer:
+    QLocalServer.removeServer(_SINGLE_INSTANCE_KEY)
+    server = QLocalServer(win)
+
+    def _on_new_connection() -> None:
+        while server.hasPendingConnections():
+            client = server.nextPendingConnection()
+            if client is not None:
+                client.waitForReadyRead(100)
+                client.readAll()
+                client.disconnectFromServer()
+                client.deleteLater()
+        win.showNormal()
+        win.raise_()
+        win.activateWindow()
+
+    server.newConnection.connect(_on_new_connection)
+    server.listen(_SINGLE_INSTANCE_KEY)
+    return server
+
+
 def main() -> None:
     ensure_dirs()
     _redirect_null_streams_for_pythonw()
@@ -188,6 +225,9 @@ def main() -> None:
             pass
 
     app = QApplication(sys.argv)
+    if _notify_existing_instance():
+        sys.exit(0)
+
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     icon = _load_app_icon()
@@ -198,6 +238,8 @@ def main() -> None:
     win = MainWindow()
     if not icon.isNull():
         win.setWindowIcon(icon)
+    _server = _start_single_instance_server(win)  # utrzymuj referencję przy życiu
+    win._instance_server = _server  # type: ignore[attr-defined]
     win.show()
     sys.exit(app.exec())
 

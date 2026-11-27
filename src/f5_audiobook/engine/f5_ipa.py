@@ -6,18 +6,17 @@ import gc
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import espeakng_loader
 import numpy as np
 import soundfile as sf
-import torch
-import torchaudio
-from f5_tts.api import F5TTS
-from phonemizer import phonemize
-from phonemizer.backend.espeak.wrapper import EspeakWrapper
-from tokenizers import Tokenizer
 
 from f5_audiobook.config import MULTI3_MODEL_DIR, VOCODER_DIR
+
+if TYPE_CHECKING:
+    import torch
+    from f5_tts.api import F5TTS
+    from tokenizers import Tokenizer
 
 _ESPEAK_INITIALIZED = False
 _BPE_SPLIT_MARK = "\u2060"
@@ -25,10 +24,31 @@ _AFFRICATE_TXT_RE = re.compile(r"trz|drz|cz|dż|tsz|dsz", re.IGNORECASE)
 _AFFRICATE_IPA_RE = re.compile(r"tʃ|dʒ")
 
 
+def preload_ai_libraries() -> str:
+    """Wczytuje w tle ciężkie biblioteki AI (PyTorch/CUDA, F5-TTS, phonemizer, tokenizers) i zwraca opis urządzenia."""
+    import torch
+    import torchaudio  # noqa: F401
+    from f5_tts.api import F5TTS  # noqa: F401
+    from phonemizer import phonemize  # noqa: F401
+    from tokenizers import Tokenizer  # noqa: F401
+
+    init_espeak()
+    if torch.cuda.is_available():
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            return f"CUDA — {gpu_name}"
+        except Exception:
+            return "CUDA"
+    return "CPU"
+
+
 def init_espeak() -> None:
     global _ESPEAK_INITIALIZED
     if _ESPEAK_INITIALIZED:
         return
+    import espeakng_loader
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
     EspeakWrapper.set_library(espeakng_loader.get_library_path())
     EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
     _ESPEAK_INITIALIZED = True
@@ -70,6 +90,8 @@ def encode_marked_ipa(tokenizer: Tokenizer, marked_ipa: str) -> list[int]:
 
 
 def text_to_ipa_pl(text: str, mark_clusters: bool = False) -> str:
+    from phonemizer import phonemize
+
     init_espeak()
     ipa = phonemize(
         text,
@@ -177,13 +199,10 @@ class F5IpaEngine:
     ) -> None:
         self.model_dir = Path(model_dir)
         self.vocoder_dir = Path(vocoder_dir)
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.use_bf16_autocast = (
-            use_bf16_autocast
-            and self.device == "cuda"
-            and torch.cuda.is_available()
-            and torch.cuda.is_bf16_supported()
-        )
+        self._requested_device = device
+        self._requested_bf16 = use_bf16_autocast
+        self._device: str | None = device
+        self._use_bf16_autocast: bool | None = None
         self.target_rms = 0.1
         self.hop_length = 256
 
@@ -196,6 +215,32 @@ class F5IpaEngine:
         self._ref_ipa: str = ""
         self._chunks_since_gc: int = 0
 
+    def _resolve_device(self) -> None:
+        if self._device is not None and self._use_bf16_autocast is not None:
+            return
+        import torch
+
+        if self._device is None:
+            self._device = self._requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._use_bf16_autocast = (
+            self._requested_bf16
+            and self._device == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.is_bf16_supported()
+        )
+
+    @property
+    def device(self) -> str:
+        self._resolve_device()
+        assert self._device is not None
+        return self._device
+
+    @property
+    def use_bf16_autocast(self) -> bool:
+        self._resolve_device()
+        assert self._use_bf16_autocast is not None
+        return self._use_bf16_autocast
+
     @property
     def is_loaded(self) -> bool:
         return self._tts is not None
@@ -207,6 +252,11 @@ class F5IpaEngine:
     def load(self) -> None:
         if self._tts is not None:
             return
+        import torch
+        from f5_tts.api import F5TTS
+        from tokenizers import Tokenizer
+
+        self._resolve_device()
         init_espeak()
 
         ckpt_path = self.model_dir / "model_1100000.pt"
@@ -258,14 +308,23 @@ class F5IpaEngine:
         self._tts = tts
 
     def unload(self) -> None:
+        was_loaded = self._tts is not None or bool(self._ref_cache)
         self._tts = None
         self._ref_audio_tensor = None
         self._ref_cache.clear()
+        if not was_loaded:
+            return
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        import sys
+
+        torch_mod = sys.modules.get("torch")
+        if torch_mod is not None and torch_mod.cuda.is_available():
+            torch_mod.cuda.empty_cache()
 
     def _prepare_reference(self, ref_audio_path: Path, ref_text: str) -> None:
+        import torch
+        import torchaudio
+
         cache_key = (str(ref_audio_path.resolve()), ref_text.strip())
         cached = self._ref_cache.get(cache_key)
         if cached is not None:
@@ -310,6 +369,8 @@ class F5IpaEngine:
         max_internal_silence_sec: float = 0.45,
     ) -> SynthesisResult:
         self.load()
+        import torch
+
         assert self._tts is not None and self._tokenizer is not None
 
         self._prepare_reference(ref_audio_path, ref_text)
@@ -418,6 +479,8 @@ class F5IpaEngine:
             ]
 
         self.load()
+        import torch
+
         assert self._tts is not None and self._tokenizer is not None
 
         self._prepare_reference(ref_audio_path, ref_text)
