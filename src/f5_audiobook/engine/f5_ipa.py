@@ -189,7 +189,8 @@ class F5IpaEngine:
 
         self._tts: F5TTS | None = None
         self._tokenizer: Tokenizer | None = None
-        self._ref_cache_key: tuple[str, str] | None = None
+        # Cache wielu głosów jednocześnie (Narrator + Mężczyzna + Kobieta -> 0 ms narzutu przy zmianie głosu!)
+        self._ref_cache: dict[tuple[str, str], tuple[torch.Tensor, float, str]] = {}
         self._ref_audio_tensor: torch.Tensor | None = None
         self._ref_rms: float = 0.1
         self._ref_ipa: str = ""
@@ -259,14 +260,16 @@ class F5IpaEngine:
     def unload(self) -> None:
         self._tts = None
         self._ref_audio_tensor = None
-        self._ref_cache_key = None
+        self._ref_cache.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _prepare_reference(self, ref_audio_path: Path, ref_text: str) -> None:
         cache_key = (str(ref_audio_path.resolve()), ref_text.strip())
-        if self._ref_cache_key == cache_key and self._ref_audio_tensor is not None:
+        cached = self._ref_cache.get(cache_key)
+        if cached is not None:
+            self._ref_audio_tensor, self._ref_rms, self._ref_ipa = cached
             return
 
         if not ref_audio_path.exists():
@@ -286,10 +289,14 @@ class F5IpaEngine:
         if sr != self.sample_rate:
             audio = torchaudio.transforms.Resample(sr, self.sample_rate)(audio)
 
-        self._ref_audio_tensor = audio.to(self.device)
+        audio_dev = audio.to(self.device)
+        ref_ipa = text_to_ipa_pl(ref_text, mark_clusters=True)
+        if len(self._ref_cache) >= 8:
+            self._ref_cache.pop(next(iter(self._ref_cache)))
+        self._ref_cache[cache_key] = (audio_dev, rms, ref_ipa)
+        self._ref_audio_tensor = audio_dev
         self._ref_rms = rms
-        self._ref_ipa = text_to_ipa_pl(ref_text, mark_clusters=True)
-        self._ref_cache_key = cache_key
+        self._ref_ipa = ref_ipa
 
     def synthesize(
         self,
@@ -380,3 +387,147 @@ class F5IpaEngine:
             seed=seed,
             ipa_text=ipa_gen,
         )
+
+    def synthesize_batch(
+        self,
+        texts: list[str],
+        ref_audio_path: Path,
+        ref_text: str,
+        speed: float = 1.15,
+        cfg_strength: float = 2.0,
+        nfe_step: int = 32,
+        seeds: list[int] | None = None,
+        max_internal_silence_sec: float = 0.45,
+    ) -> list[SynthesisResult]:
+        """Syntetyzuje paczkę (2–4) zdań tego samego lektora o zbliżonej długości w jednym przejściu GPU."""
+        if not texts:
+            return []
+        eff_seeds = seeds if (seeds and len(seeds) == len(texts)) else [101 + i for i in range(len(texts))]
+        if len(texts) == 1:
+            return [
+                self.synthesize(
+                    text=texts[0],
+                    ref_audio_path=ref_audio_path,
+                    ref_text=ref_text,
+                    speed=speed,
+                    cfg_strength=cfg_strength,
+                    nfe_step=nfe_step,
+                    seed=eff_seeds[0],
+                    max_internal_silence_sec=max_internal_silence_sec,
+                )
+            ]
+
+        self.load()
+        assert self._tts is not None and self._tokenizer is not None
+
+        self._prepare_reference(ref_audio_path, ref_text)
+        assert self._ref_audio_tensor is not None
+
+        from torch.nn.utils.rnn import pad_sequence
+
+        ref_audio_len = self._ref_audio_tensor.shape[-1] // self.hop_length
+        ref_ipa_len = max(1, len(self._ref_ipa.replace(_BPE_SPLIT_MARK, "")))
+
+        token_tensors: list[torch.Tensor] = []
+        durations: list[int] = []
+        ipa_gens: list[str] = []
+
+        for txt in texts:
+            ipa_gen_marked = text_to_ipa_pl(txt, mark_clusters=True)
+            ipa_gen = ipa_gen_marked.replace(_BPE_SPLIT_MARK, "")
+            if not ipa_gen:
+                raise ValueError(f"Pusta transkrypcja IPA dla tekstu: {txt!r}")
+            ipa_gens.append(ipa_gen)
+            full_ipa_marked = f"{self._ref_ipa} {ipa_gen_marked}"
+            token_ids = encode_marked_ipa(self._tokenizer, full_ipa_marked)
+            token_tensors.append(torch.tensor(token_ids, dtype=torch.long, device=self.device))
+
+            gen_ipa_len = max(1, len(ipa_gen))
+            local_speed = speed * 0.78 if len(txt.strip()) < 22 else speed
+            dur = max(
+                ref_audio_len + 65,
+                ref_audio_len + int((ref_audio_len / ref_ipa_len) * gen_ipa_len / max(0.5, local_speed)),
+            )
+            durations.append(dur)
+
+        bs = len(texts)
+        # Drugi bezpiecznik po przeliczeniu IPA: jeśli rzeczywista długość klatek audio (gen_dur)
+        # w paczce różni się o > 8% (np. przez dwuznaki sz/cz/rz), liczymy te zdania bezpiecznie osobno!
+        gen_durs = [max(1, d - ref_audio_len) for d in durations]
+        if max(gen_durs) > int(min(gen_durs) * 1.08) + 6:
+            return [
+                self.synthesize(
+                    text=t,
+                    ref_audio_path=ref_audio_path,
+                    ref_text=ref_text,
+                    speed=speed,
+                    cfg_strength=cfg_strength,
+                    nfe_step=nfe_step,
+                    seed=s,
+                    max_internal_silence_sec=max_internal_silence_sec,
+                )
+                for t, s in zip(texts, eff_seeds)
+            ]
+
+        text_batch = pad_sequence(token_tensors, batch_first=True, padding_value=-1)
+        cond_batch = self._ref_audio_tensor.expand(bs, -1)
+        dur_tensor = torch.tensor(durations, dtype=torch.long, device=self.device)
+
+        batch_seed = eff_seeds[0]
+        torch.manual_seed(batch_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(batch_seed)
+
+        results: list[SynthesisResult] = []
+        sr = self.sample_rate
+
+        with torch.inference_mode():
+            generated, _ = self._tts.ema_model.sample(
+                cond=cond_batch,
+                text=text_batch,
+                duration=dur_tensor,
+                steps=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=-1.0,
+                seed=batch_seed,
+            )
+            for i, dur in enumerate(durations):
+                mel_i = generated[i : i + 1, ref_audio_len:dur, :].to(torch.float32).permute(0, 2, 1)
+                wav_i = self._tts.vocoder.decode(mel_i)
+                if self._ref_rms > 0 and self._ref_rms < self.target_rms:
+                    wav_i = wav_i * (self._ref_rms / self.target_rms)
+                wav_np = wav_i.squeeze().cpu().numpy().astype(np.float32)
+
+                if np.isnan(wav_np).any() or np.isinf(wav_np).any():
+                    raise RuntimeError("Wykryto wartości NaN/Inf w wygenerowanym sygnale audio (batch).")
+
+                wav_np = trim_silence(wav_np, sr, threshold_db=-40.0, keep_lead_ms=30, keep_tail_ms=55)
+                wav_np = compress_internal_silences(wav_np, sr, max_silence_sec=max_internal_silence_sec)
+
+                peak = float(np.abs(wav_np).max()) if len(wav_np) > 0 else 0.0
+                if peak > 0.95:
+                    wav_np = wav_np * (0.95 / peak)
+
+                fade = min(int(sr * 0.01), len(wav_np) // 4)
+                if fade > 0:
+                    wav_np[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                    wav_np[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+
+                rms_out = float(np.sqrt(np.mean(wav_np**2))) if len(wav_np) > 0 else 0.0
+                results.append(
+                    SynthesisResult(
+                        wav=wav_np,
+                        sample_rate=sr,
+                        duration_sec=len(wav_np) / sr,
+                        rms=rms_out,
+                        seed=batch_seed,
+                        ipa_text=ipa_gens[i],
+                    )
+                )
+
+        self._chunks_since_gc += bs
+        if self._chunks_since_gc >= 15 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            self._chunks_since_gc = 0
+
+        return results

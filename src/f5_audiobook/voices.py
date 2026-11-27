@@ -8,7 +8,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from f5_audiobook.config import VOICES_DIR
+from f5_audiobook.config import DEFAULT_VOICE_ROLES, VOICE_ROLES_FILE, VOICES_DIR
 
 
 @dataclass
@@ -94,6 +94,27 @@ def save_voice_profile(profile: VoiceProfile, voices_dir: Path = VOICES_DIR) -> 
         encoding="utf-8",
     )
     return pfile
+
+
+def load_voice_roles(path: Path = VOICE_ROLES_FILE) -> dict[str, str]:
+    """Zwraca mapę ról {'narrator': nazwa_profilu, 'male': ..., 'female': ...}."""
+    roles = dict(DEFAULT_VOICE_ROLES)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for k in ("narrator", "male", "female"):
+                    if data.get(k):
+                        roles[k] = str(data[k])
+        except Exception:
+            pass
+    return roles
+
+
+def save_voice_roles(roles: dict[str, str], path: Path = VOICE_ROLES_FILE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clean = {k: str(roles.get(k, DEFAULT_VOICE_ROLES[k])) for k in ("narrator", "male", "female")}
+    path.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def cut_reference_sample(

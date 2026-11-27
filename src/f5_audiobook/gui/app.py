@@ -1,7 +1,8 @@
-"""Punkt wejścia aplikacji desktopowej F5-Audiobook (PySide6)."""
+"""Punkt wejścia aplikacji desktopowej bAIarz (PySide6)."""
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 
@@ -10,9 +11,17 @@ import sys
 if sys.platform == "win32":
     os.environ.setdefault("QT_MEDIA_BACKEND", "windows")
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from f5_audiobook.config import ensure_dirs
+from f5_audiobook.config import (
+    APP_ICON_ICO,
+    APP_ICON_PNG,
+    APP_NAME,
+    APP_USER_MODEL_ID,
+    WORK_DIR,
+    ensure_dirs,
+)
 from f5_audiobook.gui.main_window import MainWindow
 
 
@@ -106,12 +115,15 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     padding: 5px 8px;
     color: #e6e8ec;
 }
-QTableWidget {
+QTableWidget, QTreeWidget {
     background-color: #13151a;
     alternate-background-color: #1a1d24;
     gridline-color: #262b36;
     border: 1px solid #2c313c;
     selection-background-color: #2d6cdf;
+}
+QTreeWidget::item {
+    padding: 3px 4px;
 }
 QHeaderView::section {
     background-color: #232731;
@@ -134,13 +146,58 @@ QProgressBar::chunk {
 """
 
 
+def _redirect_null_streams_for_pythonw() -> None:
+    """Pod pythonw.exe (bez okna konsoli) sys.stdout/stderr są None — przekierowujemy je do work/baiarz.log,
+    aby komunikaty PyTorch/Vocos/F5-TTS nigdy nie wywołały błędu zapisu."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = WORK_DIR / "baiarz.log"
+        # Przytnij stary log, jeśli przekroczył 2 MB
+        mode = "w" if (log_path.exists() and log_path.stat().st_size > 2_000_000) else "a"
+        stream = open(log_path, mode, encoding="utf-8", buffering=1)
+        if sys.stdout is None:
+            sys.stdout = stream
+        if sys.stderr is None:
+            sys.stderr = stream
+    except Exception:
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        if sys.stdout is None:
+            sys.stdout = devnull
+        if sys.stderr is None:
+            sys.stderr = devnull
+
+
+def _load_app_icon() -> QIcon:
+    if APP_ICON_ICO.exists():
+        return QIcon(str(APP_ICON_ICO))
+    if APP_ICON_PNG.exists():
+        return QIcon(str(APP_ICON_PNG))
+    return QIcon()
+
+
 def main() -> None:
     ensure_dirs()
+    _redirect_null_streams_for_pythonw()
+
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
-    app.setApplicationName("F5-Audiobook")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    icon = _load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     app.setStyleSheet(DARK_STYLESHEET)
 
     win = MainWindow()
+    if not icon.isNull():
+        win.setWindowIcon(icon)
     win.show()
     sys.exit(app.exec())
 

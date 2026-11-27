@@ -23,6 +23,17 @@ class ChapterRow:
     selected: bool
     total_chunks: int = 0
     done_chunks: int = 0
+    multi_voice: bool = False
+    dialogue_tagged: int = 0
+    dialogue_untagged: int = 0
+
+
+@dataclass
+class RechunkMultiVoiceResult:
+    converted_chapters: int
+    skipped_done_chapters: int
+    new_chunks: int
+    dialogue_chunks: int
 
 
 @dataclass
@@ -43,6 +54,7 @@ class ChunkRow:
     qg_note: str
     heard_text: str
     error_msg: str
+    voice_role: str = "narrator"  # narrator | male | female | dialogue
 
 
 def slugify_project_name(title: str) -> str:
@@ -86,7 +98,8 @@ class ProjectDB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chapter_index INTEGER NOT NULL UNIQUE,
                     title TEXT NOT NULL,
-                    selected INTEGER NOT NULL DEFAULT 1
+                    selected INTEGER NOT NULL DEFAULT 1,
+                    multi_voice INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS chunks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,10 +116,18 @@ class ProjectDB:
                     qg_note TEXT NOT NULL DEFAULT '',
                     heard_text TEXT NOT NULL DEFAULT '',
                     error_msg TEXT NOT NULL DEFAULT '',
+                    voice_role TEXT NOT NULL DEFAULT 'narrator',
                     UNIQUE(chapter_id, chunk_index)
                 );
                 """
             )
+            # Automatyczna migracja starszych projektów (np. work/Silos/project.db)
+            ch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(chapters)").fetchall()}
+            if "multi_voice" not in ch_cols:
+                conn.execute("ALTER TABLE chapters ADD COLUMN multi_voice INTEGER NOT NULL DEFAULT 0")
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+            if "voice_role" not in cols:
+                conn.execute("ALTER TABLE chunks ADD COLUMN voice_role TEXT NOT NULL DEFAULT 'narrator'")
 
     def set_meta(self, key: str, value: str) -> None:
         with self._connect() as conn:
@@ -134,6 +155,7 @@ class ProjectDB:
         work_root: Path = WORK_DIR,
         base_seed: int = 101,
         max_chars: int = 165,
+        multi_voice: bool = False,
     ) -> "ProjectDB":
         slug = slugify_project_name(book.title)
         proj_dir = work_root / slug
@@ -150,6 +172,7 @@ class ProjectDB:
         db.set_meta("author", book.author)
         db.set_meta("source_path", str(book.source_path))
         db.set_meta("cover_path", cover_path_str)
+        db.set_meta("multi_voice", "1" if multi_voice else "0")
 
         with db._connect() as conn:
             conn.execute("DELETE FROM chunks")
@@ -157,8 +180,8 @@ class ProjectDB:
 
             for ch in book.chapters:
                 cur = conn.execute(
-                    "INSERT INTO chapters(chapter_index, title, selected) VALUES (?, ?, ?)",
-                    (ch.index, ch.title, 1 if ch.selected else 0),
+                    "INSERT INTO chapters(chapter_index, title, selected, multi_voice) VALUES (?, ?, ?, ?)",
+                    (ch.index, ch.title, 1 if ch.selected else 0, 1 if multi_voice else 0),
                 )
                 chapter_id = cur.lastrowid
                 chunks = chunk_paragraphs(
@@ -167,14 +190,15 @@ class ProjectDB:
                     max_chars=max_chars,
                     chapter_title=ch.title,
                     include_title=True,
+                    multi_voice=multi_voice,
                 )
                 for c in chunks:
                     conn.execute(
                         """
                         INSERT INTO chunks(
                             chapter_id, chunk_index, raw_text, normalized_text,
-                            pause_after_ms, status, seed
-                        ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                            pause_after_ms, status, seed, voice_role
+                        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
                         """,
                         (
                             chapter_id,
@@ -183,18 +207,112 @@ class ProjectDB:
                             c.normalized_text,
                             c.pause_after_ms,
                             base_seed + ch.index * 1000 + c.index,
+                            c.voice_role,
                         ),
                     )
         return db
+
+    def is_multi_voice(self) -> bool:
+        if self.get_meta("multi_voice", "0") == "1":
+            return True
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM chapters WHERE multi_voice = 1 LIMIT 1").fetchone()
+            return row is not None
+
+    def rechunk_selected_chapters_multi_voice(
+        self,
+        pronunciation_dict: dict[str, str] | None = None,
+        source_path: Path | None = None,
+        base_seed: int = 101,
+        max_chars: int = 165,
+        skip_with_done_audio: bool = True,
+    ) -> RechunkMultiVoiceResult:
+        """Dzieli na nowo zaznaczone rozdziały istniejącego projektu w trybie 3 głosów (dialogi + narrator).
+
+        Domyślnie bezpiecznie pomija rozdziały, które mają już wygenerowane pliki WAV (done_chunks > 0).
+        """
+        from f5_audiobook.text.epub_parser import parse_book
+
+        src = Path(source_path) if source_path is not None else Path(self.get_meta("source_path", ""))
+        if not str(src) or not src.exists() or not src.is_file():
+            raise FileNotFoundError(f"Nie znaleziono pliku źródłowego książki: {src}")
+
+        if source_path is not None:
+            self.set_meta("source_path", str(src))
+
+        book = parse_book(src)
+        by_index = {ch.index: ch for ch in book.chapters}
+        by_title = {ch.title.strip().lower(): ch for ch in book.chapters}
+
+        chapters = [ch for ch in self.list_chapters() if ch.selected]
+        converted = 0
+        skipped_done = 0
+        new_chunks_total = 0
+        dialogue_chunks_total = 0
+
+        with self._connect() as conn:
+            for ch in chapters:
+                if ch.done_chunks > 0 and skip_with_done_audio:
+                    skipped_done += 1
+                    continue
+
+                book_ch = by_index.get(ch.chapter_index) or by_title.get(ch.title.strip().lower())
+                if book_ch is None:
+                    continue
+
+                chunks = chunk_paragraphs(
+                    book_ch.paragraphs,
+                    pronunciation_dict=pronunciation_dict,
+                    max_chars=max_chars,
+                    chapter_title=ch.title,
+                    include_title=True,
+                    multi_voice=True,
+                )
+                conn.execute("DELETE FROM chunks WHERE chapter_id = ?", (ch.id,))
+                for c in chunks:
+                    conn.execute(
+                        """
+                        INSERT INTO chunks(
+                            chapter_id, chunk_index, raw_text, normalized_text,
+                            pause_after_ms, status, seed, voice_role
+                        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                        """,
+                        (
+                            ch.id,
+                            c.index,
+                            c.raw_text,
+                            c.normalized_text,
+                            c.pause_after_ms,
+                            base_seed + ch.chapter_index * 1000 + c.index,
+                            c.voice_role,
+                        ),
+                    )
+                    if c.voice_role in ("male", "female", "dialogue"):
+                        dialogue_chunks_total += 1
+                conn.execute("UPDATE chapters SET multi_voice = 1 WHERE id = ?", (ch.id,))
+                converted += 1
+                new_chunks_total += len(chunks)
+
+        if converted > 0:
+            self.set_meta("multi_voice", "1")
+
+        return RechunkMultiVoiceResult(
+            converted_chapters=converted,
+            skipped_done_chapters=skipped_done,
+            new_chunks=new_chunks_total,
+            dialogue_chunks=dialogue_chunks_total,
+        )
 
     def list_chapters(self) -> list[ChapterRow]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT
-                    ch.id, ch.chapter_index, ch.title, ch.selected,
+                    ch.id, ch.chapter_index, ch.title, ch.selected, ch.multi_voice,
                     COUNT(c.id) AS total_chunks,
-                    SUM(CASE WHEN c.status = 'done' THEN 1 ELSE 0 END) AS done_chunks
+                    SUM(CASE WHEN c.status = 'done' THEN 1 ELSE 0 END) AS done_chunks,
+                    SUM(CASE WHEN c.voice_role IN ('male', 'female') THEN 1 ELSE 0 END) AS dialogue_tagged,
+                    SUM(CASE WHEN c.voice_role = 'dialogue' THEN 1 ELSE 0 END) AS dialogue_untagged
                 FROM chapters ch
                 LEFT JOIN chunks c ON c.chapter_id = ch.id
                 GROUP BY ch.id
@@ -209,6 +327,9 @@ class ProjectDB:
                 selected=bool(r["selected"]),
                 total_chunks=r["total_chunks"] or 0,
                 done_chunks=r["done_chunks"] or 0,
+                multi_voice=bool(r["multi_voice"]),
+                dialogue_tagged=int(r["dialogue_tagged"] or 0),
+                dialogue_untagged=int(r["dialogue_untagged"] or 0),
             )
             for r in rows
         ]
@@ -218,6 +339,17 @@ class ProjectDB:
             conn.execute(
                 "UPDATE chapters SET selected=? WHERE id=?",
                 (1 if selected else 0, chapter_id),
+            )
+
+    def set_chapters_selected_bulk(self, chapter_ids: list[int], selected: bool) -> None:
+        """Zaznacza/odznacza wiele rozdziałów w jednej transakcji SQLite (błyskawiczne dla całych części)."""
+        if not chapter_ids:
+            return
+        val = 1 if selected else 0
+        with self._connect() as conn:
+            conn.executemany(
+                "UPDATE chapters SET selected=? WHERE id=?",
+                [(val, int(cid)) for cid in chapter_ids],
             )
 
     def _row_to_chunk(self, r: sqlite3.Row) -> ChunkRow:
@@ -238,6 +370,7 @@ class ProjectDB:
             qg_note=r["qg_note"] or "",
             heard_text=r["heard_text"] or "",
             error_msg=r["error_msg"] or "",
+            voice_role=(r["voice_role"] if "voice_role" in r.keys() and r["voice_role"] else "narrator"),
         )
 
     def list_chunks(self, chapter_id: int | None = None, only_selected: bool = False) -> list[ChunkRow]:
@@ -341,6 +474,48 @@ class ProjectDB:
                 "UPDATE chunks SET normalized_text=?, status='pending' WHERE id=?",
                 (new_normalized_text.strip(), chunk_id),
             )
+
+    def set_chunk_voice_role(self, chunk_id: int, voice_role: str, reset_to_pending: bool = True) -> None:
+        role = voice_role if voice_role in ("narrator", "male", "female", "dialogue") else "narrator"
+        with self._connect() as conn:
+            if reset_to_pending:
+                conn.execute(
+                    "UPDATE chunks SET voice_role=?, status='pending' WHERE id=?",
+                    (role, chunk_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE chunks SET voice_role=? WHERE id=?",
+                    (role, chunk_id),
+                )
+
+    def set_chunks_voice_roles_bulk(
+        self, role_map: dict[int, str], reset_changed_to_pending: bool = True
+    ) -> int:
+        """Aktualizuje role głosowe wielu chunków w jednej transakcji SQLite. Zwraca liczbę zmienionych."""
+        if not role_map:
+            return 0
+        valid = {"narrator", "male", "female", "dialogue"}
+        changed = 0
+        with self._connect() as conn:
+            for cid, raw_role in role_map.items():
+                role = raw_role if raw_role in valid else "narrator"
+                row = conn.execute("SELECT voice_role FROM chunks WHERE id=?", (int(cid),)).fetchone()
+                if row is None:
+                    continue
+                if row["voice_role"] != role:
+                    if reset_changed_to_pending:
+                        conn.execute(
+                            "UPDATE chunks SET voice_role=?, status='pending' WHERE id=?",
+                            (role, int(cid)),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE chunks SET voice_role=? WHERE id=?",
+                            (role, int(cid)),
+                        )
+                    changed += 1
+        return changed
 
     def reapply_pronunciation_to_pending(self, pronunciation_dict: dict[str, str]) -> int:
         """Stosuje aktualny słownik wymowy do wszystkich jeszcze niewygenerowanych (pending) chunków."""

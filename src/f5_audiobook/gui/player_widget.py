@@ -44,6 +44,25 @@ from f5_audiobook.pipeline.project_db import ChapterRow, ChunkRow, ProjectDB
 
 STATS_FILE = WORK_DIR / "player_stats.json"
 CHAPTER_LEAD_IN_MS = 250
+AUTO_REWIND_SHORT_MS = 2_000
+AUTO_REWIND_LONG_MS = 15_000
+AUTO_REWIND_LONG_THRESHOLD_SEC = 3600.0  # <= 1 godzina -> 2 s, > 1 godzina -> 15 s
+
+
+def compute_auto_rewind_ms(paused_at_epoch: float | None, now_epoch: float | None = None) -> int:
+    """Oblicza automatyczne cofnięcie (w ms) przy wznawianiu odsłuchu (styl Smart AudioBook Player).
+
+    - Przerwa <= 1 godzina -> 2 s (2000 ms)
+    - Przerwa > 1 godzina  -> 15 s (15000 ms)
+    - Brak pauzy (nowa pozycja / ręczny skok) -> 0 ms
+    """
+    if paused_at_epoch is None:
+        return 0
+    now = time.time() if now_epoch is None else float(now_epoch)
+    elapsed = max(0.0, now - float(paused_at_epoch))
+    if elapsed > AUTO_REWIND_LONG_THRESHOLD_SEC:
+        return AUTO_REWIND_LONG_MS
+    return AUTO_REWIND_SHORT_MS
 
 
 def _fmt_mmss(ms: int) -> str:
@@ -148,6 +167,7 @@ class AudiobookPlayerWidget(QWidget):
         self._session_listened_sec: float = 0.0
         self._last_tick_mono: float | None = None
         self._last_persist_mono: float = time.monotonic()
+        self._last_paused_epoch: float | None = None
 
         # Timer odświeżania UI i śledzenia karaoke (100 ms -> płynne podświetlanie)
         self._ui_timer = QTimer(self)
@@ -485,6 +505,7 @@ class AudiobookPlayerWidget(QWidget):
         self._book_listened_sec = 0.0
         self._session_listened_sec = 0.0
         self._paused_ch_ms = 0
+        self._last_paused_epoch = None
         self._karaoke_chunk_to_row.clear()
         self.list_karaoke.clear()
 
@@ -539,7 +560,20 @@ class AudiobookPlayerWidget(QWidget):
             else:
                 saved_offset_ms = 0
             self._load_playable_index(start_idx, offset_ms=saved_offset_ms, autoplay=False)
+
+            paused_ts_raw = meta.get("player_paused_at_ts", "").strip()
+            if paused_ts_raw:
+                try:
+                    self._last_paused_epoch = float(paused_ts_raw)
+                except ValueError:
+                    self._last_paused_epoch = None
+            elif start_idx > 0 or saved_offset_ms > 0:
+                # Istniejący projekt zapisany przed tą funkcją -> przy pierwszym wznowieniu potraktuj jak dłuższą przerwę (15 s)
+                self._last_paused_epoch = 0.0
+            else:
+                self._last_paused_epoch = None
         else:
+            self._last_paused_epoch = None
             self._update_controls_enabled()
             self._update_time_labels()
 
@@ -795,6 +829,7 @@ class AudiobookPlayerWidget(QWidget):
         self._is_playing = False
         self._pending_autoplay = False
         self._last_tick_mono = None
+        self._last_paused_epoch = time.time()
         self._player.pause()
         self.btn_play_pause.setText("▶ Odtwórz")
         self.persist_state()
@@ -958,8 +993,25 @@ class AudiobookPlayerWidget(QWidget):
         self._sync_audio_output_device()
 
         if self._current_idx < 0:
+            self._last_paused_epoch = None
             self._load_playable_index(0, offset_ms=0, autoplay=True)
             return
+
+        # Automatyczne cofnięcie po przerwie (styl Smart AudioBook Player: 2 s <= 1 h, 15 s > 1 h)
+        rewind_ms = compute_auto_rewind_ms(self._last_paused_epoch)
+        self._last_paused_epoch = None
+        if rewind_ms > 0:
+            cur_book_ms = self.current_book_ms()
+            if cur_book_ms > 0:
+                target_ms = max(0, cur_book_ms - rewind_ms)
+                idx = bisect.bisect_right(self._playable_starts_ms, target_ms) - 1
+                idx = max(0, min(idx, len(self._playable) - 1))
+                target_entry = self._playable[idx]
+                offset_ms = max(0, min(target_ms - target_entry.book_start_ms, max(0, target_entry.duration_ms - 60)))
+                self._load_playable_index(idx, offset_ms=offset_ms, autoplay=True)
+                kind = "dłuższej przerwie" if rewind_ms >= AUTO_REWIND_LONG_MS else "krótkiej przerwie"
+                self.status_message.emit(f"⏪ Auto-cofnięcie o {rewind_ms // 1000} s po {kind}")
+                return
 
         entry = self._playable[self._current_idx]
         if (
@@ -1012,6 +1064,7 @@ class AudiobookPlayerWidget(QWidget):
     def seek_to_book_ms(self, target_ms: int) -> None:
         if not self._playable:
             return
+        self._last_paused_epoch = None
         clamped = max(0, min(int(target_ms), max(0, self._book_total_ms - 80)))
         idx = bisect.bisect_right(self._playable_starts_ms, clamped) - 1
         idx = max(0, min(idx, len(self._playable) - 1))
@@ -1023,6 +1076,7 @@ class AudiobookPlayerWidget(QWidget):
     def seek_to_chapter_ms(self, target_ch_ms: int) -> None:
         if not self._playable or self._current_chapter_id is None:
             return
+        self._last_paused_epoch = None
         first_idx = self._chapter_first_playable_idx.get(self._current_chapter_id)
         if first_idx is None:
             return
@@ -1067,6 +1121,7 @@ class AudiobookPlayerWidget(QWidget):
         if ch_id is None or ch_id not in self._chapter_first_playable_idx:
             return
         target_idx = self._chapter_first_playable_idx[ch_id]
+        self._last_paused_epoch = None
         self._load_playable_index(target_idx, offset_ms=0, autoplay=self._is_playing)
         self.persist_state()
 
@@ -1280,7 +1335,8 @@ class AudiobookPlayerWidget(QWidget):
         for row_idx, c in enumerate(chunks):
             txt = (c.raw_text or c.normalized_text).strip()
             is_ready = c.id in self._chunk_id_to_playable_idx
-            item = QListWidgetItem(f"#{c.chunk_index + 1}  {txt}")
+            role_ico = " 👨" if c.voice_role == "male" else (" 👩" if c.voice_role == "female" else "")
+            item = QListWidgetItem(f"#{c.chunk_index + 1}{role_ico}  {txt}")
             item.setData(Qt.UserRole, c.id)
             item.setData(Qt.UserRole + 1, is_ready)
             item.setData(Qt.UserRole + 2, c.chunk_index + 1)
@@ -1373,6 +1429,7 @@ class AudiobookPlayerWidget(QWidget):
             self.status_message.emit("Ten fragment nie został jeszcze wygenerowany.")
             return
         target_idx = self._chunk_id_to_playable_idx[chunk_id]
+        self._last_paused_epoch = None
         self._load_playable_index(target_idx, offset_ms=0, autoplay=True)
         self.persist_state()
 
@@ -1467,5 +1524,11 @@ class AudiobookPlayerWidget(QWidget):
                     offset_ms = max(0, self.current_chapter_ms() - entry.ch_start_ms)
                     self.db.set_meta("player_chunk_id", str(entry.chunk.id))
                     self.db.set_meta("player_offset_ms", str(min(offset_ms, entry.duration_ms)))
+                if self._is_playing:
+                    self.db.set_meta("player_paused_at_ts", f"{time.time():.2f}")
+                elif self._last_paused_epoch is not None:
+                    self.db.set_meta("player_paused_at_ts", f"{self._last_paused_epoch:.2f}")
+                else:
+                    self.db.set_meta("player_paused_at_ts", "")
             except Exception:
                 pass

@@ -28,12 +28,14 @@ class BatchWorker(QThread):
         db: ProjectDB,
         voice: VoiceProfile,
         options: BatchOptions,
+        voice_map: dict[str, VoiceProfile] | None = None,
     ) -> None:
         super().__init__()
         self.engine = engine
         self.db = db
         self.voice = voice
         self.options = options
+        self.voice_map = voice_map
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
 
@@ -58,6 +60,7 @@ class BatchWorker(QThread):
                 stop_event=self.stop_event,
                 progress_cb=lambda p: self.progress.emit(p),
                 log_cb=lambda msg: self.log.emit(msg),
+                voice_map=self.voice_map,
             )
             self.finished_ok.emit(res)
         except Exception as e:
@@ -112,6 +115,7 @@ class RegenerateChunkWorker(QThread):
         voice: VoiceProfile,
         options: BatchOptions,
         new_text: str | None = None,
+        voice_map: dict[str, VoiceProfile] | None = None,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -120,6 +124,7 @@ class RegenerateChunkWorker(QThread):
         self.voice = voice
         self.options = options
         self.new_text = new_text
+        self.voice_map = voice_map
 
     def run(self) -> None:
         try:
@@ -131,8 +136,70 @@ class RegenerateChunkWorker(QThread):
                 options=self.options,
                 new_text=self.new_text,
                 log_cb=lambda m: self.log.emit(m),
+                voice_map=self.voice_map,
             )
             self.finished_ok.emit(updated)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class BielikTaggerWorker(QThread):
+    """Analizuje dialogi w zaznaczonych rozdziałach lokalnym modelem Bielik-4.5B (llama.cpp CUDA)."""
+
+    progress = Signal(int, int, str)       # done_chapters, total_chapters, message
+    log = Signal(str)
+    finished_ok = Signal(int, int, int)    # updated_count, male_count, female_count
+    failed = Signal(str)
+
+    def __init__(self, db: ProjectDB, only_selected: bool = True) -> None:
+        super().__init__()
+        self.db = db
+        self.only_selected = only_selected
+        self.stop_event = threading.Event()
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        from f5_audiobook.engine.bielik_tagger import BielikTagger
+
+        try:
+            chapters = self.db.list_chapters()
+            if self.only_selected:
+                chapters = [ch for ch in chapters if ch.selected]
+            total_ch = len(chapters)
+            if total_ch == 0:
+                self.finished_ok.emit(0, 0, 0)
+                return
+
+            updated_total = 0
+            male_total = 0
+            female_total = 0
+
+            with BielikTagger() as tagger:
+                self.log.emit(f"Bielik AI gotowy. Analizuję dialogi w {total_ch} rozdziałach...")
+                for idx, ch in enumerate(chapters, 1):
+                    if self.stop_event.is_set():
+                        self.log.emit("Przerwano analizę Bielika na żądanie użytkownika.")
+                        break
+                    chunks = self.db.list_chunks(chapter_id=ch.id)
+                    assignments = tagger.tag_chapter_chunks(chunks)
+                    if assignments:
+                        changed = self.db.set_chunks_voice_roles_bulk(
+                            assignments, reset_changed_to_pending=True
+                        )
+                        updated_total += changed
+                        m_cnt = sum(1 for r in assignments.values() if r == "male")
+                        f_cnt = sum(1 for r in assignments.values() if r == "female")
+                        male_total += m_cnt
+                        female_total += f_cnt
+                        msg = f"[Bielik {idx}/{total_ch}] {ch.title}: M={m_cnt}, K={f_cnt} (zmieniono {changed})"
+                    else:
+                        msg = f"[Bielik {idx}/{total_ch}] {ch.title}: brak dialogów"
+                    self.log.emit(msg)
+                    self.progress.emit(idx, total_ch, msg)
+
+            self.finished_ok.emit(updated_total, male_total, female_total)
         except Exception as e:
             self.failed.emit(str(e))
 

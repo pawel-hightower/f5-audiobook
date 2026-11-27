@@ -5,7 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+APP_NAME = "bAIarz"
+APP_TITLE = "bAIarz — Generator Polskich Audiobooków AI"
+APP_USER_MODEL_ID = "bAIarz.AudiobookStudio.1"
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ASSETS_DIR = PROJECT_ROOT / "assets"
+APP_ICON_ICO = ASSETS_DIR / "baiarz.ico"
+APP_ICON_PNG = ASSETS_DIR / "baiarz.png"
 MODELS_DIR = PROJECT_ROOT / "models"
 VOICES_DIR = PROJECT_ROOT / "voices"
 WORK_DIR = PROJECT_ROOT / "work"
@@ -15,6 +22,15 @@ PRONUNCIATION_FILE = PROJECT_ROOT / "pronunciation.json"
 MULTI3_MODEL_DIR = MODELS_DIR / "gregniuki-f5tts-multi3" / "multi3"
 VOCODER_DIR = MODELS_DIR / "vocos-mel-24khz"
 WHISPER_CACHE_DIR = MODELS_DIR / "faster-whisper"
+BIELIK_MODEL_DIR = MODELS_DIR / "bielik-4.5b-v3"
+LLAMA_CPP_DIR = MODELS_DIR / "llama-cpp"
+VOICE_ROLES_FILE = VOICES_DIR / "roles.json"
+
+DEFAULT_VOICE_ROLES: dict[str, str] = {
+    "narrator": "moj_lektor",
+    "male": "kosior",
+    "female": "kaminska",
+}
 
 DEFAULT_PRONUNCIATION: dict[str, str] = {
     "audiobook": "audiobuk",
